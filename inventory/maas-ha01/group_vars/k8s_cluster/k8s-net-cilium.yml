@@ -202,8 +202,9 @@ cilium_operator_replicas: 2
 ##  cilium_config_extra_vars:
 ##    var1: "value1"
 ##    var2: "value2"
-cilium_config_extra_vars: 
-  loadBalancer.dsrDispatch: "geneve"
+cilium_extra_values:
+  loadBalancer:
+    dsrDispatch: "geneve"
 
 # For adding and mounting extra volumes to the cilium operator
 # cilium_operator_extra_volumes: []
