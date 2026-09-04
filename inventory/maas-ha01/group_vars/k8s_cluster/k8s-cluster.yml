@@ -24,7 +24,7 @@ retry_stagger: 5
 
 # This is the user that owns the cluster installation.
 # Note: cilium needs to set kube_owner to root https://kubespray.io/#/docs/CNI/cilium?id=unprivileged-agent-configuration
-kube_owner: kube
+kube_owner: root
 
 # This is the group that the cert creation scripts chgrp the
 # cert files to. Not really changeable...
