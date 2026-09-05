@@ -1,0 +1,42 @@
+---
+# One-command clean reinstall used when GPUStack is broken (for example the
+# embedded PostgreSQL schema is stale or corrupt): uninstall the Helm release,
+# move the server hostPath data aside on the node(s) that have it, install from
+# scratch and run the health checks. Moved data stays recoverable under
+# /var/lib/gpustack-server.broken-<timestamp>.
+#
+# Run:
+#   ansible-playbook -i inventory/maas-test/inventory.ini \
+#     --become --become-user=root maas-gpustack-reset.yml
+
+- name: Uninstall GPUStack and move stale server data aside
+  hosts: kube_node
+  become: true
+  vars:
+    maas_gpustack_phase: reset
+  roles:
+    - maas-gpustack
+
+- name: Install GPUStack from scratch
+  hosts: kube_node
+  become: true
+  vars:
+    maas_gpustack_phase: gpustack
+  roles:
+    - maas-gpustack
+
+- name: Check GPUStack components
+  hosts: kube_control_plane[0]
+  become: true
+  vars:
+    maas_gpustack_phase: check
+  roles:
+    - maas-gpustack
+
+- name: Print GPUStack access information
+  hosts: kube_control_plane[0]
+  become: true
+  vars:
+    maas_gpustack_phase: access
+  roles:
+    - maas-gpustack

@@ -1,0 +1,53 @@
+---
+# Reset used by maas-gpustack-reset.yml before a clean reinstall: uninstall the
+# existing Helm release, then move any stale /var/lib/gpustack-server hostPath
+# directory aside on every node that has one. Helm uninstall alone never removes
+# the hostPath, so the next install would otherwise reuse the broken database.
+
+- name: Read the GPUStack Helm release state
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/helm"
+      - status
+      - "{{ gpustack_release_name }}"
+      - "--namespace={{ gpustack_namespace }}"
+      - --output=json
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: gpustack_release_status
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  changed_when: false
+  failed_when: false
+
+- name: Uninstall the GPUStack Helm release
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/helm"
+      - uninstall
+      - "{{ gpustack_release_name }}"
+      - "--namespace={{ gpustack_namespace }}"
+      - --no-hooks
+      - --wait
+      - --ignore-not-found
+      - "--timeout=10m"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  when:
+    - gpustack_release_status.rc == 0
+
+- name: Check every node for a stale GPUStack server data directory
+  ansible.builtin.stat:
+    path: "{{ gpustack_server_data_path }}"
+  register: gpustack_reset_server_data
+
+- name: Move the stale GPUStack server data directory aside
+  ansible.builtin.command:
+    argv:
+      - mv
+      - "{{ gpustack_server_data_path }}"
+      - "{{ gpustack_server_data_path }}.broken-{{ '%Y%m%d%H%M%S' | strftime }}"
+  when:
+    - gpustack_reset_server_data.stat.exists

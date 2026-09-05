@@ -31,6 +31,10 @@
   ansible.builtin.include_tasks: gpustack.yml
   when: maas_gpustack_phase == 'gpustack'
 
+- name: Reset GPUStack for a clean reinstall
+  ansible.builtin.include_tasks: gpustack-reset.yml
+  when: maas_gpustack_phase == 'reset'
+
 - name: Check GPUStack components
   ansible.builtin.include_tasks: check-gpustack.yml
   when: maas_gpustack_phase == 'check'
