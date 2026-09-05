@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-higress-plugins
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "chart_labels" . | indent 4 }}
+spec:
+  replicas: {{ .Values.higressPlugins.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-higress-plugins
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-higress-plugins
+{{ include "chart_labels" . | indent 8 }}
+    spec:
+      {{- with (include "image_pull_secrets" . | trim) }}
+      {{- nindent 6 . }}
+      {{- end }}
+      containers:
+        - name: higress-plugins
+          image: {{ include "higressPlugins.image" . }}
+          imagePullPolicy: {{ .Values.higressPlugins.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10

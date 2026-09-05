@@ -1,0 +1,16 @@
+---
+# Single source of truth for "is this a GPU node". Both the toolkit phase (to
+# skip CDI generation, which fails without a GPU) and the gpustack phase (to
+# label only real GPU nodes) include this file, so the two can never disagree.
+- name: Detect the NVIDIA PCI device on this node
+  ansible.builtin.shell: |
+    set -o pipefail
+    lspci -nn 2>/dev/null | grep -qi '\[{{ gpustack_gpu_pci_vendor_id }}:' && echo present || echo absent
+  args:
+    executable: /bin/bash
+  register: gpustack_gpu_pci_probe
+  changed_when: false
+
+- name: Record whether this node has an NVIDIA GPU
+  ansible.builtin.set_fact:
+    gpustack_node_has_gpu: "{{ gpustack_gpu_pci_probe.stdout | trim == 'present' }}"

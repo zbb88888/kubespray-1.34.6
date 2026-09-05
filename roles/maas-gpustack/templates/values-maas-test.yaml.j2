@@ -1,0 +1,67 @@
+# GPUStack Helm values for the maas-test Kubernetes cluster.
+clusterDomain: cluster.local
+
+global:
+  hub: docker.io
+
+image:
+  # The chart's appVersion lags the main branch, so the tag must be explicit.
+  tag: "{{ gpustack_image_tag }}"
+  pullPolicy: IfNotPresent
+
+server:
+  replicas: 1
+  ingress:
+{% if gpustack_server_ingress_hostname is not none %}
+    hostname: "{{ gpustack_server_ingress_hostname }}"
+{% endif %}
+{% if gpustack_gateway_https_enabled %}
+    tls:
+      cert: {{ gpustack_server_ingress_tls_cert_effective | to_json }}
+      key: {{ gpustack_server_ingress_tls_key_effective | to_json }}
+{% endif %}
+  nodeSelector:
+    kubernetes.io/hostname: "{{ gpustack_server_node }}"
+  dataVolume:
+    hostPath: "{{ gpustack_server_data_path }}"
+
+worker:
+  enabled: true
+  gpuVendors:
+    - nvidia
+  dataDir: /var/lib/gpustack
+
+operator:
+  image:
+    tag: "{{ gpustack_operator_image_tag }}"
+
+higress-core:
+  enabled: true
+  gateway:
+    # This cluster has no cloud provider and no MetalLB, so the subchart's
+    # default LoadBalancer Service would sit at EXTERNAL-IP <pending> forever.
+    # Helm's --wait blocks on exactly that, burning the full timeout even when
+    # every workload is ready. NodePort is the only reachable type here.
+    service:
+      type: NodePort
+      ports:
+{% if gpustack_gateway_http_enabled %}
+        - name: http2
+          port: {{ gpustack_gateway_http_port }}
+          protocol: TCP
+          targetPort: {{ gpustack_gateway_http_port }}
+{% endif %}
+{% if gpustack_gateway_https_enabled and gpustack_server_ingress_hostname is not none %}
+        - name: https
+          port: {{ gpustack_gateway_https_port }}
+          protocol: TCP
+          targetPort: {{ gpustack_gateway_https_port }}
+{% endif %}
+      externalTrafficPolicy: Local
+
+higressPlugins:
+  image:
+    tag: "{{ gpustack_higress_plugins_image_tag }}"
+
+gateway:
+  ingressClassname: higress

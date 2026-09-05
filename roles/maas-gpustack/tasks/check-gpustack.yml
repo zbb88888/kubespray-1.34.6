@@ -1,0 +1,269 @@
+---
+# The GPUStack operator is not a Helm-managed resource: the chart's
+# post-install hook Job renders it with ytt and applies it with kubectl, so
+# `helm --wait` never covers it. The operator in turn installs Kueue through
+# its own Helm release. Both live outside Helm's view and must be checked here.
+- name: Ensure the GPUStack check output directory exists
+  ansible.builtin.file:
+    path: "{{ gpustack_check_output_dir }}"
+    state: directory
+    mode: '0700'
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Wait for the GPUStack operator Deployment
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - rollout
+      - status
+      - deployment/{{ gpustack_release_name }}-operator
+      - "--namespace={{ gpustack_namespace }}"
+      - "--timeout={{ gpustack_operator_timeout }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  changed_when: false
+
+# Kueue is installed by the operator, never by this role. A manual
+# `kubectl apply` of the upstream manifests breaks the operator's Helm release
+# with an ownership conflict, so only presence is verified here.
+- name: Read the Kueue CRDs installed by the GPUStack operator
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: "{{ item }}"
+  loop:
+    - clusterqueues.kueue.x-k8s.io
+    - localqueues.kueue.x-k8s.io
+    - resourceflavors.kueue.x-k8s.io
+    - workloads.kueue.x-k8s.io
+  loop_control:
+    label: "{{ item }}"
+  register: gpustack_kueue_crds
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  retries: "{{ gpustack_kueue_retries }}"
+  delay: "{{ gpustack_kueue_delay }}"
+  until: gpustack_kueue_crds.resources | default([]) | length == 1
+
+# The CRD objects are huge, so only the verdict is printed and the full
+# objects are written to a file on the first control node.
+- name: Save the Kueue CRD details
+  ansible.builtin.copy:
+    content: "{{ gpustack_kueue_crds.results | map(attribute='resources.0') | list | to_nice_yaml }}"
+    dest: "{{ gpustack_check_output_dir }}/kueue-crds.yaml"
+    mode: '0600'
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Verify Kueue is owned by the GPUStack operator Helm release
+  ansible.builtin.assert:
+    that:
+      - gpustack_kueue_unowned_crds | length == 0
+    fail_msg: >-
+      CRDs {{ gpustack_kueue_unowned_crds }} exist but carry no Helm release
+      annotation. They were most likely applied manually, which blocks the
+      GPUStack operator from installing Kueue. Remove the manual installation
+      and let the operator own it. Details:
+      {{ gpustack_check_output_dir }}/kueue-crds.yaml
+  vars:
+    gpustack_kueue_unowned_crds: >-
+      {{ gpustack_kueue_crds.results | map(attribute='resources.0')
+         | rejectattr('metadata.annotations', 'defined') | map(attribute='metadata.name') | list
+         + (gpustack_kueue_crds.results | map(attribute='resources.0')
+            | selectattr('metadata.annotations', 'defined')
+            | rejectattr('metadata.annotations', 'contains', 'meta.helm.sh/release-name')
+            | map(attribute='metadata.name') | list) }}
+  run_once: true
+
+- name: Read the Kueue queues used by GPUStack inference workloads
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+    api_version: kueue.x-k8s.io/v1beta1
+    kind: ClusterQueue
+  register: gpustack_kueue_clusterqueues
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  retries: "{{ gpustack_kueue_retries }}"
+  delay: "{{ gpustack_kueue_delay }}"
+  until: gpustack_kueue_clusterqueues.resources | default([]) | length > 0
+
+- name: Show the Kueue queues
+  ansible.builtin.debug:
+    msg: >-
+      ClusterQueue:
+      {{ gpustack_kueue_clusterqueues.resources | map(attribute='metadata.name') | list }}
+  run_once: true
+
+# The operator creates a second wave of workloads after Helm returns: NFD,
+# Kueue, the CSI drivers and the device-manager DaemonSet. Asserting on a
+# single snapshot here always races them, so wait for that wave to settle
+# first. Succeeded Pods are excluded because they carry no Ready condition.
+- name: Wait for every long-lived GPUStack Pod to become Ready
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - wait
+      - --for=condition=Ready
+      - pod
+      - --all
+      - "--namespace={{ gpustack_namespace }}"
+      - --field-selector=status.phase!=Succeeded
+      - "--timeout={{ gpustack_pod_ready_timeout }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: gpustack_pod_ready_wait
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  changed_when: false
+  retries: "{{ gpustack_pod_ready_retries }}"
+  delay: "{{ gpustack_pod_ready_delay }}"
+  until: gpustack_pod_ready_wait.rc == 0
+
+# The operator version must match __operator_version__ baked into the GPUStack
+# image. A mismatch is silent at install time: every workload is Ready, but the
+# operator writes node labels and Kueue queue names in a scheme the worker
+# cannot parse, and model deployment fails much later.
+- name: Read the operator version required by the GPUStack image
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - exec
+      - "--namespace={{ gpustack_namespace }}"
+      - "{{ gpustack_release_name }}-server-0"
+      - --
+      - python3
+      - -c
+      - import gpustack; print(gpustack.__operator_version__)
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: gpustack_required_operator_version
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  changed_when: false
+
+- name: Verify the pinned operator version matches the GPUStack image
+  ansible.builtin.assert:
+    that:
+      - gpustack_required_operator_version.stdout | trim == gpustack_operator_image_tag
+    fail_msg: >-
+      GPUStack expects operator {{ gpustack_required_operator_version.stdout | trim }}
+      but gpustack_operator_image_tag is {{ gpustack_operator_image_tag }}.
+      Set gpustack_operator_image_tag to
+      {{ gpustack_required_operator_version.stdout | trim }} and reinstall.
+  run_once: true
+
+- name: Collect GPUStack namespace resources
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+    namespace: "{{ gpustack_namespace }}"
+  loop:
+    - { api_version: v1, kind: Pod }
+    - { api_version: apps/v1, kind: Deployment }
+    - { api_version: apps/v1, kind: StatefulSet }
+    - { api_version: apps/v1, kind: DaemonSet }
+    - { api_version: batch/v1, kind: Job }
+    - { api_version: v1, kind: Service }
+    - { api_version: networking.k8s.io/v1, kind: Ingress }
+    - { api_version: v1, kind: Event }
+  loop_control:
+    label: "{{ item.kind }}"
+  register: gpustack_resources
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Show GPUStack namespace resource names
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item.kind }}:
+      {{ item.resources | map(attribute='metadata.name') | list }}
+  loop: "{{ gpustack_resources.results }}"
+  loop_control:
+    label: "{{ item.item.kind }}"
+  run_once: true
+
+- name: Collect GPUStack Pods
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+    api_version: v1
+    kind: Pod
+    namespace: "{{ gpustack_namespace }}"
+  register: gpustack_pods
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Build the list of long-lived GPUStack Pods
+  ansible.builtin.set_fact:
+    gpustack_managed_pods: >-
+      {{ gpustack_pods.resources
+         | rejectattr('metadata.ownerReferences', 'defined')
+         | list
+         + (gpustack_pods.resources
+            | selectattr('metadata.ownerReferences', 'defined')
+            | rejectattr('metadata.ownerReferences.0.kind', 'equalto', 'Job')
+            | list) }}
+  run_once: true
+
+- name: Show GPUStack Pod health
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.metadata.name }} phase={{ item.status.phase | default('Unknown') }}
+      node={{ item.spec.nodeName | default('-') }}
+      ip={{ item.status.podIP | default('-') }}
+      ready={{ item.status.containerStatuses | default([]) |
+        selectattr('ready', 'equalto', true) | list | length }}/{{
+        item.status.containerStatuses | default([]) | length }}
+      restarts={{ item.status.containerStatuses | default([]) |
+        map(attribute='restartCount') | list }}
+      images={{ item.spec.containers | map(attribute='image') | list }}
+  loop: "{{ gpustack_pods.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  run_once: true
+
+# Helm hook Pods owned by a Job are excluded: hook-delete-policy removes them
+# concurrently, so their container statuses can disappear mid-check.
+- name: Verify GPUStack Pods are healthy
+  ansible.builtin.assert:
+    that:
+      - item.status.phase in ['Running', 'Succeeded']
+      - item.status.containerStatuses is defined
+      - item.status.containerStatuses | length == item.spec.containers | length
+      - >-
+        (item.status.phase == 'Running' and
+        (item.status.containerStatuses | selectattr('ready', 'equalto', true) | list | length) == item.spec.containers | length)
+        or
+        (item.status.phase == 'Succeeded' and
+        (item.status.containerStatuses | selectattr('state.terminated.exitCode', 'equalto', 0) | list | length) == item.spec.containers | length)
+    fail_msg: >-
+      Pod {{ item.metadata.name }} is not healthy: phase={{ item.status.phase | default('Unknown') }}.
+      node={{ item.spec.nodeName | default('-') }}
+      statuses={{ item.status.containerStatuses | default([]) }}
+  loop: "{{ gpustack_managed_pods }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  run_once: true
+
+- name: Verify GPUStack DaemonSets are fully scheduled and ready
+  ansible.builtin.assert:
+    that:
+      - item.status.desiredNumberScheduled | default(0) == item.status.currentNumberScheduled | default(0)
+      - item.status.desiredNumberScheduled | default(0) == item.status.numberReady | default(0)
+      - item.status.desiredNumberScheduled | default(0) == item.status.updatedNumberScheduled | default(0)
+      - item.status.desiredNumberScheduled | default(0) == item.status.numberAvailable | default(0)
+    fail_msg: >-
+      DaemonSet {{ item.metadata.name }} is not ready:
+      desired={{ item.status.desiredNumberScheduled | default(0) }},
+      current={{ item.status.currentNumberScheduled | default(0) }},
+      ready={{ item.status.numberReady | default(0) }},
+      updated={{ item.status.updatedNumberScheduled | default(0) }},
+      available={{ item.status.numberAvailable | default(0) }}.
+  loop: "{{ (gpustack_resources.results | selectattr('item.kind', 'equalto', 'DaemonSet') | list | first).resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  run_once: true

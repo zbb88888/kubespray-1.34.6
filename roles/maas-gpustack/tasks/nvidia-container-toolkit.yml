@@ -1,0 +1,142 @@
+---
+- name: Detect whether this node has an NVIDIA GPU
+  ansible.builtin.include_tasks: nvidia-detect-gpu.yml
+
+- name: Install NVIDIA Container Toolkit repository prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - gnupg
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_facts.distribution == 'Ubuntu'
+
+- name: Download the NVIDIA Container Toolkit signing key
+  ansible.builtin.get_url:
+    url: https://nvidia.github.io/libnvidia-container/gpgkey
+    dest: /usr/share/keyrings/nvidia-container-toolkit-keyring.asc
+    mode: '0644'
+  when: ansible_facts.distribution == 'Ubuntu'
+
+- name: Convert the NVIDIA Container Toolkit signing key to a keyring
+  ansible.builtin.command:
+    cmd: >-
+      gpg --dearmor
+      -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+      /usr/share/keyrings/nvidia-container-toolkit-keyring.asc
+    creates: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  when: ansible_facts.distribution == 'Ubuntu'
+
+- name: Download the NVIDIA Container Toolkit APT repository definition
+  ansible.builtin.get_url:
+    url: https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list
+    dest: /tmp/nvidia-container-toolkit.list
+    mode: '0644'
+  when: ansible_facts.distribution == 'Ubuntu'
+
+- name: Bind the NVIDIA repository to its signing key
+  ansible.builtin.replace:
+    path: /tmp/nvidia-container-toolkit.list
+    regexp: '^deb https://'
+    replace: >-
+      deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://
+  when: ansible_facts.distribution == 'Ubuntu'
+
+- name: Install the NVIDIA Container Toolkit APT repository definition
+  ansible.builtin.copy:
+    src: /tmp/nvidia-container-toolkit.list
+    dest: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    remote_src: true
+    mode: '0644'
+  when: ansible_facts.distribution == 'Ubuntu'
+
+- name: Install NVIDIA Container Toolkit
+  ansible.builtin.apt:
+    name: >-
+      nvidia-container-toolkit{{ ('=' + nvidia_container_toolkit_version)
+      if nvidia_container_toolkit_version is defined else '' }}
+    state: present
+    update_cache: true
+  when: ansible_facts.distribution == 'Ubuntu'
+
+- name: Configure NVIDIA Container Runtime for containerd
+  ansible.builtin.shell: |
+    set -e
+    before=$(sha256sum /etc/containerd/config.toml 2>/dev/null || true)
+    nvidia-ctk runtime configure --runtime=containerd >/dev/null
+    after=$(sha256sum /etc/containerd/config.toml 2>/dev/null || true)
+    [ "$before" = "$after" ] || printf '%s\n' changed
+  args:
+    executable: /bin/bash
+  register: nvidia_containerd_runtime
+  changed_when: nvidia_containerd_runtime.stdout | trim == 'changed'
+  notify: Restart containerd
+  when:
+    - ansible_facts.distribution == 'Ubuntu'
+    - container_manager is defined
+    - container_manager == 'containerd'
+
+- name: Flush containerd handlers before generating CDI
+  ansible.builtin.meta: flush_handlers
+  when:
+    - ansible_facts.distribution == 'Ubuntu'
+    - container_manager is defined
+    - container_manager == 'containerd'
+
+# Restarting containerd takes every container on the node with it, so the
+# kubelet briefly reports NotReady. The gpustack phase schedules a GPU test Pod
+# right after this, so the node has to be back before the play continues.
+- name: Wait for this node to become Ready again
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - wait
+      - "node/{{ inventory_hostname }}"
+      - --for=condition=Ready
+      - "--timeout={{ nvidia_node_ready_timeout }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  changed_when: false
+  when:
+    - ansible_facts.distribution == 'Ubuntu'
+    - container_manager is defined
+    - container_manager == 'containerd'
+    - nvidia_containerd_runtime.changed | default(false)
+
+# CDI is the container runtime device catalog. It describes GPU devices,
+# /dev/nvidia* nodes, capabilities, libraries, and firmware for CDI-aware
+# runtimes; it does not create Kubernetes nvidia.com/gpu resources.
+- name: Generate the NVIDIA CDI specification
+  ansible.builtin.command:
+    cmd: nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+  register: nvidia_cdi_generate
+  changed_when: false
+  async: 60
+  poll: 5
+  when:
+    - ansible_facts.distribution == 'Ubuntu'
+    - gpustack_node_has_gpu
+
+# List reads the generated CDI specification and reports names usable by a
+# CDI-aware runtime, such as nvidia.com/gpu=0 and nvidia.com/gpu=all.
+- name: Verify the NVIDIA CDI devices
+  ansible.builtin.command: nvidia-ctk cdi list
+  register: nvidia_cdi_list
+  changed_when: false
+  failed_when: >-
+    nvidia_cdi_list.rc != 0 or
+    nvidia_cdi_list.stdout is not search('nvidia.com/gpu=')
+  async: 60
+  poll: 5
+  when:
+    - ansible_facts.distribution == 'Ubuntu'
+    - gpustack_node_has_gpu
+
+- name: Read the NVIDIA Container Toolkit version
+  ansible.builtin.command: nvidia-ctk --version
+  register: nvidia_container_toolkit_version_result
+  changed_when: false
+  failed_when: false
+  when: ansible_facts.distribution == 'Ubuntu'

@@ -1,0 +1,123 @@
+---
+- name: Resolve the enabled GPUStack gateway listeners
+  ansible.builtin.set_fact:
+    gpustack_gateway_https_active: >-
+      {{ gpustack_gateway_https_enabled
+         and gpustack_server_ingress_hostname is not none }}
+  run_once: true
+
+- name: Read the GPUStack gateway Service
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+    api_version: v1
+    kind: Service
+    name: higress-gateway
+    namespace: "{{ gpustack_namespace }}"
+  register: gpustack_gateway_service
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Verify the GPUStack gateway Service
+  ansible.builtin.assert:
+    that:
+      - gpustack_gateway_service.resources | length == 1
+      - gpustack_gateway_service.resources[0].spec.type in ['NodePort', 'LoadBalancer']
+      - (not gpustack_gateway_http_enabled) or (gpustack_gateway_service.resources[0].spec.ports | selectattr('port', 'equalto', gpustack_gateway_http_port) | list | length == 1)
+      - (not (gpustack_gateway_https_active | bool)) or (gpustack_gateway_service.resources[0].spec.ports | selectattr('port', 'equalto', gpustack_gateway_https_port) | list | length == 1)
+      - (not gpustack_gateway_http_enabled) or ((gpustack_gateway_service.resources[0].spec.ports | selectattr('port', 'equalto', gpustack_gateway_http_port) | map(attribute='nodePort') | first) is not none)
+      - (not (gpustack_gateway_https_active | bool)) or ((gpustack_gateway_service.resources[0].spec.ports | selectattr('port', 'equalto', gpustack_gateway_https_port) | map(attribute='nodePort') | first) is not none)
+    fail_msg: >-
+      Service/{{ gpustack_namespace }}/higress-gateway is missing, is not a
+      NodePort/LoadBalancer Service, or does not expose the enabled listener.
+  run_once: true
+
+- name: Read the GPUStack gateway Pods
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+    api_version: v1
+    kind: Pod
+    namespace: "{{ gpustack_namespace }}"
+    label_selectors:
+      - app=higress-gateway
+  register: gpustack_gateway_pods
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Verify the GPUStack gateway Pods
+  ansible.builtin.assert:
+    that:
+      - gpustack_gateway_pods.resources | length > 0
+      - gpustack_gateway_pods.resources | selectattr('spec.nodeName', 'defined') | list | length > 0
+    fail_msg: "No scheduled Higress gateway Pod was found in {{ gpustack_namespace }}."
+  run_once: true
+
+- name: Build the GPUStack gateway node list
+  ansible.builtin.set_fact:
+    gpustack_gateway_nodes: >-
+      {{ gpustack_gateway_pods.resources
+         | selectattr('spec.nodeName', 'defined')
+         | map(attribute='spec.nodeName') | unique | list }}
+    gpustack_gateway_http_node_port: >-
+      {{ gpustack_gateway_service.resources[0].spec.ports
+         | selectattr('port', 'equalto', gpustack_gateway_http_port)
+         | map(attribute='nodePort') | list | first | default('') }}
+    gpustack_gateway_https_node_port: >-
+      {{ gpustack_gateway_service.resources[0].spec.ports
+         | selectattr('port', 'equalto', gpustack_gateway_https_port)
+         | map(attribute='nodePort') | list | first | default('') }}
+  run_once: true
+
+- name: Verify the gateway nodes exist in the inventory
+  ansible.builtin.assert:
+    that:
+      - item in hostvars
+    fail_msg: >-
+      Higress gateway runs on Kubernetes node '{{ item }}', which has no
+      matching inventory host. The access URL cannot be derived.
+  loop: "{{ gpustack_gateway_nodes }}"
+  run_once: true
+
+- name: Read the GPUStack initial admin password
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - exec
+      - "--namespace={{ gpustack_namespace }}"
+      - "{{ gpustack_release_name }}-server-0"
+      - --
+      - cat
+      - /var/lib/gpustack/initial_admin_password
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: gpustack_admin_password
+  # GPUStack deletes the file once the admin password has been changed, so a
+  # missing file means the cluster is already in use, not a broken install.
+  failed_when:
+    - gpustack_admin_password.rc != 0
+    - "'No such file or directory' not in gpustack_admin_password.stderr"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  changed_when: false
+
+- name: Print GPUStack login information
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['GPUStack username: admin',
+          'GPUStack password: ' ~ (gpustack_admin_password.stdout | trim
+                                    if gpustack_admin_password.rc == 0
+                                    else 'already changed, initial password file removed'),
+          'GPUStack access URLs (externalTrafficPolicy='
+          ~ (gpustack_gateway_service.resources[0].spec.externalTrafficPolicy | default('Cluster')) ~ '):']
+         + (['HTTP: ' ~ (gpustack_gateway_nodes
+              | map('extract', hostvars, 'ansible_host')
+              | map('regex_replace', '^(.*)$', 'http://\1:' ~ gpustack_gateway_http_node_port)
+              | list | join(' '))]
+            if gpustack_gateway_http_enabled else [])
+         + (['HTTPS: ' ~ (gpustack_gateway_nodes
+              | map('extract', hostvars, 'ansible_host')
+              | map('regex_replace', '^(.*)$', 'https://\1:' ~ gpustack_gateway_https_node_port)
+              | list | join(' ')),
+             'HTTPS domain: https://' ~ gpustack_server_ingress_hostname ~ ':' ~ gpustack_gateway_https_node_port]
+            if gpustack_gateway_https_active | bool else []) }}
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true

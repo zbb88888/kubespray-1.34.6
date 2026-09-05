@@ -1,0 +1,328 @@
+{{- if .Values.worker.enabled }}
+{{- $vendors := include "gpustack.sortedVendors" . | fromJsonArray }}
+{{- $base := include "gpustack.workerBaseNodeSelectorJson" . | fromJson }}
+{{- $pciIds := include "gpustack.pciVendorIds" . | fromJson }}
+{{- $dsBasename := printf "%s-worker" .Release.Name }}
+
+{{- /*
+Build the list of DaemonSets to render. Each entry carries:
+  name          - logical name used in app labels and runtime tag
+  dsName        - actual DaemonSet metadata.name
+  runtime       - vendor runtime tag for per-vendor blocks (empty for CPU)
+  nodeSelector  - effective nodeSelector (base merged with vendor label)
+*/}}
+{{- $workers := list }}
+
+{{- /* CPU DaemonSet — always rendered first, owns the legacy name. */}}
+{{- $cpuLabel := dict "feature.gpustack.ai/acceleratable" "false" }}
+{{- $cpuSel := mergeOverwrite (deepCopy $base) $cpuLabel }}
+{{- $workers = append $workers (dict "name" "cpu" "dsName" $dsBasename "runtime" "" "nodeSelector" $cpuSel) }}
+
+{{- /* GPU vendor DaemonSets — all get suffixed names. */}}
+{{- range $vendor := $vendors }}
+  {{- $pciId := index $pciIds $vendor }}
+  {{- $vendorSel := dict }}
+  {{- if $pciId }}
+    {{- $pciLabel := printf "feature.node.kubernetes.io/pci-%s.present" $pciId }}
+    {{- $vendorSel = dict $pciLabel "true" }}
+  {{- end }}
+  {{- $merged := mergeOverwrite (deepCopy $base) $vendorSel }}
+  {{- $workers = append $workers (dict "name" $vendor "dsName" (printf "%s-%s" $dsBasename $vendor) "runtime" $vendor "nodeSelector" $merged) }}
+{{- end }}
+
+{{- $multiVendor := gt (len $workers) 1 }}
+
+{{- range $idx, $w := $workers }}
+{{- if $idx }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: {{ $w.dsName }}
+{{ include "chart_labels" $ | indent 4 }}
+    {{- if $multiVendor }}
+    app.kubernetes.io/component: worker
+    gpustack.io/runtime: {{ $w.name }}
+    {{- end }}
+  name: {{ $w.dsName }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: {{ $w.dsName }}
+  template:
+    metadata:
+      labels:
+        app: {{ $w.dsName }}
+        {{- if $multiVendor }}
+        app.kubernetes.io/component: worker
+        gpustack.io/runtime: {{ $w.name }}
+        {{- end }}
+    spec:
+      # Disable Kubernetes service-link env injection. Kubernetes injects a
+      # <SVCNAME>_PORT=tcp://... env var (name uppercased, '-' -> '_') for every
+      # Service in the namespace; a GPUSTACK_-prefixed name would collide with
+      # GPUStack's GPUSTACK_-prefixed config defaults and crash-loop prerun
+      # (e.g. a worker Service named gpustack-worker -> GPUSTACK_WORKER_PORT).
+      # GPUStack sets every env it needs explicitly and resolves peers via DNS,
+      # so it never relies on these link vars. KUBERNETES_SERVICE_HOST and
+      # KUBERNETES_SERVICE_PORT are exempt from this flag and keep working.
+      enableServiceLinks: false
+      {{- with (include "image_pull_secrets" $ | trim) }}
+      {{- nindent 6 . }}
+      {{- end }}
+      containers:
+        - env:
+            - name: GPUSTACK_SERVER_URL
+              value: http://{{ $.Release.Name }}-server.{{ $.Release.Namespace }}.svc:{{ $.Values.server.apiPort }}
+            - name: GPUSTACK_WORKER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: GPUSTACK_RUNTIME_DEPLOY
+              value: "Kubernetes"
+            - name: GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT
+              value: "true"
+            - name: GPUSTACK_RUNTIME_DEPLOY_MIRRORED_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GPUSTACK_RUNTIME_KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: GPUSTACK_RUNTIME_KUBERNETES_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: GPUSTACK_WORKER_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            {{- if eq $w.runtime "hygon" }}
+            - name: ROCM_PATH
+              value: /opt/dtk
+            - name: ROCM_SMI_LIB_PATH
+              value: /opt/hyhal/lib
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: registration-token
+                optional: false
+            - configMapRef:
+                name: worker-config
+                optional: true
+          image: {{ include "gpustack.image" $ }}:{{ include "gpustack.imageTag" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          name: {{ $.Release.Name }}-worker
+          resources: {}
+          securityContext:
+            allowPrivilegeEscalation: true
+            capabilities: {}
+            privileged: true
+            readOnlyRootFilesystem: false
+            runAsNonRoot: false
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - name: gpustack-data-dir
+              mountPath: /var/lib/gpustack
+            - name: cdi
+              mountPath: /var/run/cdi
+            - name: kubelet-device-plugins
+              mountPath: /var/lib/kubelet/device-plugins
+            {{- if eq $w.runtime "amd" }}
+            - name: gpustack-amd-driver
+              mountPath: /opt/rocm
+              readOnly: true
+            - name: gpustack-amd-driver-lib
+              mountPath: /opt/rocm/lib
+              readOnly: true
+            {{- end }}
+            {{- if eq $w.runtime "ascend" }}
+            - name: gpustack-ascend-driver
+              mountPath: /usr/local/Ascend/driver
+              readOnly: true
+            - name: gpustack-ascend-toolkit
+              mountPath: /usr/local/Ascend/ascend-toolkit
+              readOnly: true
+            {{- end }}
+            {{- if eq $w.runtime "hygon" }}
+            - name: gpustack-hygon-driver
+              mountPath: /opt/hyhal
+              readOnly: true
+            - name: gpustack-hygon-toolkit
+              mountPath: /opt/dtk
+              readOnly: true
+            - name: gpustack-hygon-mig-config
+              mountPath: /etc/dmi_mig_config
+              readOnly: true
+            {{- end }}
+            {{- if eq $w.runtime "metax" }}
+            - name: gpustack-metax-driver
+              mountPath: /opt/mxdriver
+              readOnly: true
+            - name: gpustack-metax-toolkit
+              mountPath: /opt/maca
+              readOnly: true
+            {{- end }}
+            {{- if eq $w.runtime "iluvatar" }}
+            - name: gpustack-iluvatar-toolkit
+              mountPath: /usr/local/corex
+              readOnly: true
+            {{- end }}
+            {{- if eq $w.runtime "cambricon" }}
+            - name: gpustack-cambricon-bin
+              mountPath: /usr/bin/cnmon
+            - name: gpustack-cambricon-toolkit
+              mountPath: /usr/local/neuware
+              readOnly: true
+            {{- end }}
+            {{- if eq $w.runtime "thead" }}
+            - name: gpustack-thead-toolkit
+              mountPath: /usr/local/PPU_SDK
+              readOnly: true
+            {{- end }}
+            {{- with $.Values.worker.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: api
+              containerPort: {{ $.Values.worker.port }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ $.Values.worker.metricsPort }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 5
+            successThreshold: 1
+      volumes:
+        - name: gpustack-data-dir
+          hostPath:
+            path: {{ $.Values.worker.dataDir }}
+            type: DirectoryOrCreate
+        - name: cdi
+          hostPath:
+            path: /var/run/cdi
+            type: DirectoryOrCreate
+        - name: kubelet-device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: DirectoryOrCreate
+        {{- if eq $w.runtime "amd" }}
+        - name: gpustack-amd-driver
+          hostPath:
+            path: /opt/rocm
+            type: DirectoryOrCreate
+        # Separate source: /opt/rocm/lib may be a symlink (e.g. to
+        # /etc/alternatives) that would dangle inside the container.
+        - name: gpustack-amd-driver-lib
+          hostPath:
+            path: /opt/rocm/lib
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $w.runtime "ascend" }}
+        - name: gpustack-ascend-driver
+          hostPath:
+            path: /usr/local/Ascend/driver
+            type: DirectoryOrCreate
+        - name: gpustack-ascend-toolkit
+          hostPath:
+            path: /usr/local/Ascend/ascend-toolkit
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $w.runtime "hygon" }}
+        - name: gpustack-hygon-driver
+          hostPath:
+            path: /opt/hyhal
+            type: DirectoryOrCreate
+        - name: gpustack-hygon-toolkit
+          hostPath:
+            path: /opt/dtk
+            type: DirectoryOrCreate
+        - name: gpustack-hygon-mig-config
+          hostPath:
+            path: /etc/dmi_mig_config
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $w.runtime "metax" }}
+        - name: gpustack-metax-driver
+          hostPath:
+            path: /opt/mxdriver
+            type: DirectoryOrCreate
+        - name: gpustack-metax-toolkit
+          hostPath:
+            path: /opt/maca
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $w.runtime "iluvatar" }}
+        - name: gpustack-iluvatar-toolkit
+          hostPath:
+            path: /usr/local/corex
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $w.runtime "cambricon" }}
+        - name: gpustack-cambricon-bin
+          hostPath:
+            path: /usr/bin/cnmon
+            type: FileOrCreate
+        - name: gpustack-cambricon-toolkit
+          hostPath:
+            path: /usr/local/neuware
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $w.runtime "thead" }}
+        - name: gpustack-thead-toolkit
+          hostPath:
+            path: /usr/local/PPU_SDK
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- with $.Values.worker.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if $multiVendor }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/component: worker
+              namespaceSelector: {}
+      {{- end }}
+      {{- if $w.nodeSelector }}
+      nodeSelector:
+        {{- toYaml $w.nodeSelector | nindent 8 }}
+      {{- end }}
+      hostNetwork: true
+      hostIPC: true
+      serviceAccountName: {{ $.Release.Name }}-worker
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- if or (eq $w.runtime "nvidia") (eq $w.runtime "mthreads") }}
+      runtimeClassName: {{ $w.runtime }}
+      {{- end }}
+  updateStrategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
+{{- end }}
+{{- end }}

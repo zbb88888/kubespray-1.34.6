@@ -1,0 +1,75 @@
+---
+- name: Check whether this node requires a reboot
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: nvidia_reboot_required
+
+- name: Read the installed driver version
+  ansible.builtin.shell: |
+    set -o pipefail
+    dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 2>/dev/null |
+      awk '$1 == "ii" && $2 ~ /^nvidia-driver-[0-9]+(-(open|server))?$/ {print $3; exit}' || true
+  args:
+    executable: /bin/bash
+  register: nvidia_installed_driver
+  changed_when: false
+  failed_when: false
+
+- name: Read the loaded driver version
+  ansible.builtin.shell: |
+    nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n 1
+  args:
+    executable: /bin/bash
+  register: nvidia_loaded_driver
+  changed_when: false
+  failed_when: false
+
+- name: Normalize installed and loaded NVIDIA driver versions
+  ansible.builtin.set_fact:
+    nvidia_installed_driver_version: "{{ nvidia_installed_driver.stdout | trim | regex_search('^[0-9]+\\.[0-9]+') | default('', true) }}"
+    nvidia_loaded_driver_version: "{{ nvidia_loaded_driver.stdout | trim | regex_search('^[0-9]+\\.[0-9]+') | default('', true) }}"
+
+- name: Determine why this node requires a reboot
+  ansible.builtin.set_fact:
+    nvidia_reboot_reasons: >-
+      {%- set reasons = [] -%}
+      {%- if nvidia_reboot_required.stat.exists -%}
+      {%-   set _ = reasons.append('/var/run/reboot-required exists') -%}
+      {%- endif -%}
+      {%- if nvidia_reboot_required_by_role | default(false) -%}
+      {%-   set _ = reasons.append('NVIDIA package state changed during this run') -%}
+      {%- endif -%}
+      {%- if nvidia_installed_driver_version != '' and nvidia_loaded_driver_version == '' -%}
+      {%-   set _ = reasons.append('NVIDIA driver is installed but not loaded') -%}
+      {%- elif nvidia_installed_driver_version != '' and nvidia_installed_driver_version != nvidia_loaded_driver_version -%}
+      {%-   set _ = reasons.append('installed=' ~ nvidia_installed_driver_version ~ ', loaded=' ~ nvidia_loaded_driver_version) -%}
+      {%- endif -%}
+      {{ reasons }}
+
+- name: Decide whether this node requires a reboot
+  ansible.builtin.set_fact:
+    nvidia_reboot_needed: "{{ nvidia_reboot_reasons | length > 0 }}"
+
+- name: Ask before rebooting this node
+  ansible.builtin.pause:
+    prompt: >-
+      {{ inventory_hostname }} requires a reboot.
+      Reasons: {{ nvidia_reboot_reasons | join('; ') }}.
+      Type 'yes' to reboot it
+  register: nvidia_reboot_confirmation
+  delegate_to: localhost
+  when: nvidia_reboot_needed
+
+- name: Reboot this node after confirmation
+  ansible.builtin.reboot:
+    reboot_timeout: 900
+  when:
+    - nvidia_reboot_needed
+    - nvidia_reboot_confirmation.user_input | default('') | lower == 'yes'
+
+- name: Stop if reboot was declined
+  ansible.builtin.fail:
+    msg: "Reboot required for {{ inventory_hostname }}; reboot declined. Run the role again after reboot."
+  when:
+    - nvidia_reboot_needed
+    - nvidia_reboot_confirmation.user_input | default('') | lower != 'yes'

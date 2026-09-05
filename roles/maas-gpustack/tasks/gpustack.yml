@@ -1,0 +1,456 @@
+---
+# GPUStack schedules its NVIDIA worker DaemonSet with the NFD PCI-presence
+# label. NFD is not guaranteed to advertise it, so the label is applied only to
+# nodes whose lspci actually reports the vendor ID.
+- name: Detect whether this node has an NVIDIA GPU
+  ansible.builtin.include_tasks: nvidia-detect-gpu.yml
+
+- name: Build the list of GPU nodes
+  ansible.builtin.set_fact:
+    gpustack_gpu_nodes: >-
+      {{ groups['kube_node']
+         | map('extract', hostvars)
+         | selectattr('gpustack_node_has_gpu')
+         | map(attribute='inventory_hostname')
+         | list }}
+  run_once: true
+
+- name: Verify at least one GPU node was detected
+  ansible.builtin.assert:
+    that:
+      - gpustack_gpu_nodes | length > 0
+    fail_msg: >-
+      No kube_node reports PCI vendor {{ gpustack_gpu_pci_vendor_id }};
+      the GPUStack NVIDIA worker DaemonSet would stay unscheduled.
+  run_once: true
+
+- name: Label GPU nodes for GPUStack NVIDIA workers
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Node
+      metadata:
+        name: "{{ item }}"
+        # Ansible templates dict values, never dict keys, so the label name has
+        # to be built inside a single templated expression.
+        labels: "{{ {'feature.node.kubernetes.io/pci-' ~ gpustack_gpu_pci_vendor_id ~ '.present': 'true'} }}"
+  loop: "{{ gpustack_gpu_nodes }}"
+  loop_control:
+    label: "{{ item }}"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Inspect the NVIDIA containerd handler
+  ansible.builtin.command:
+    argv:
+      - containerd
+      - config
+      - dump
+  register: nvidia_containerd_config
+  changed_when: false
+  failed_when: false
+
+- name: Verify the NVIDIA containerd handler is configured
+  ansible.builtin.assert:
+    that:
+      - nvidia_containerd_config.rc == 0
+      - nvidia_containerd_config.stdout is search('(?im)runtimes.*nvidia')
+    fail_msg: >-
+      NVIDIA containerd handler 'nvidia' is missing on {{ inventory_hostname }}.
+      RuntimeClass/nvidia requires a matching containerd runtime handler.
+
+- name: Collect NVIDIA Container Toolkit versions
+  ansible.builtin.set_fact:
+    nvidia_container_toolkit_versions: >-
+      {%- set versions = [] -%}
+      {%- for node in groups['kube_node'] -%}
+      {%-   set _ = versions.append(hostvars[node].nvidia_container_toolkit_version_result.stdout | default('') | trim) -%}
+      {%- endfor -%}
+      {{ versions }}
+  delegate_to: localhost
+  delegate_facts: true
+  run_once: true
+
+- name: Verify NVIDIA Container Toolkit versions
+  ansible.builtin.assert:
+    that:
+      - nvidia_container_toolkit_version_result is defined
+      - nvidia_container_toolkit_version_result.rc | default(1) == 0
+      - nvidia_container_toolkit_version_result.stdout | default('') | trim != ''
+      - hostvars['localhost'].nvidia_container_toolkit_versions | unique | length == 1
+    fail_msg: >-
+      NVIDIA Container Toolkit is unavailable or versions differ across
+      kube_node. An undefined value means the 'toolkit' phase was skipped: run
+      maas-gpustack-post-k8s.yml from the start instead of the gpustack phase
+      alone. Versions:
+      {{ hostvars['localhost'].nvidia_container_toolkit_versions }}
+
+- name: Verify the GPUStack deployment prerequisites
+  ansible.builtin.assert:
+    that:
+      - container_manager is defined
+      - container_manager == 'containerd'
+      - groups['kube_control_plane'] | length > 0
+      - groups['kube_node'] | length > 0
+      - gpustack_server_node in groups['kube_node']
+    fail_msg: >-
+      GPUStack requires containerd, at least one control-plane node and worker
+      node, and a server node in kube_node.
+  run_once: true
+
+- name: Verify the bundled GPUStack chart dependency
+  ansible.builtin.stat:
+    path: "{{ role_path }}/files/gpustack-chart/charts/{{ gpustack_chart_dependency_file }}"
+  register: gpustack_chart_dependency
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Fail when the bundled GPUStack chart dependency is missing
+  ansible.builtin.assert:
+    that:
+      - gpustack_chart_dependency.stat.exists
+      - gpustack_chart_dependency.stat.isreg
+    fail_msg: >-
+      Missing bundled Helm dependency:
+      {{ role_path }}/files/gpustack-chart/charts/{{ gpustack_chart_dependency_file }}.
+      Run helm dependency build in the source chart and commit the resulting
+      archive before running this role.
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Copy the bundled GPUStack Helm chart to the Helm host
+  ansible.builtin.copy:
+    src: gpustack-chart/
+    dest: "{{ gpustack_chart_path }}/"
+    directory_mode: '0755'
+    mode: preserve
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Ensure GPUStack server data directory exists
+  ansible.builtin.file:
+    path: "{{ gpustack_server_data_path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  delegate_to: "{{ gpustack_server_node }}"
+  run_once: true
+
+- name: Validate GPUStack HTTPS settings
+  ansible.builtin.assert:
+    that:
+      - gpustack_server_ingress_hostname is not none
+      - (gpustack_server_ingress_tls_cert is none) == (gpustack_server_ingress_tls_key is none)
+    fail_msg: >-
+      HTTPS requires gpustack_server_ingress_hostname and either both
+      gpustack_server_ingress_tls_cert/gpustack_server_ingress_tls_key or neither.
+  run_once: true
+  when: gpustack_gateway_https_enabled
+
+- name: Confirm use of the test GPUStack HTTPS defaults
+  ansible.builtin.pause:
+    prompt: >-
+      The GPUStack HTTPS settings still use test defaults or a generated
+      self-signed certificate. Production must set
+      gpustack_server_ingress_hostname, gpustack_server_ingress_tls_cert and
+      gpustack_server_ingress_tls_key to production values. Type 'yes' to
+      continue, or anything else to stop
+  register: gpustack_https_default_confirmation
+  failed_when: gpustack_https_default_confirmation.user_input | lower != 'yes'
+  run_once: true
+  when:
+    - gpustack_gateway_https_enabled
+    - gpustack_server_ingress_hostname == 'gpustack.local'
+      or gpustack_server_ingress_tls_cert is none
+      or gpustack_server_ingress_tls_key is none
+
+- name: Ensure the default GPUStack TLS directory exists
+  ansible.builtin.file:
+    path: "{{ gpustack_server_ingress_tls_dir }}"
+    state: directory
+    mode: '0700'
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  when:
+    - gpustack_gateway_https_enabled
+    - gpustack_server_ingress_tls_cert is none
+    - gpustack_server_ingress_tls_key is none
+
+- name: Generate the default GPUStack self-signed TLS certificate
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -x509
+      - -nodes
+      - -newkey
+      - rsa:2048
+      - -days
+      - '3650'
+      - -keyout
+      - "{{ gpustack_server_ingress_tls_dir }}/tls.key"
+      - -out
+      - "{{ gpustack_server_ingress_tls_dir }}/tls.crt"
+      - -subj
+      - "/CN={{ gpustack_server_ingress_hostname }}"
+      - -addext
+      - "subjectAltName=DNS:{{ gpustack_server_ingress_hostname }}"
+    creates: "{{ gpustack_server_ingress_tls_dir }}/tls.crt"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  when:
+    - gpustack_gateway_https_enabled
+    - gpustack_server_ingress_tls_cert is none
+    - gpustack_server_ingress_tls_key is none
+
+- name: Read the default GPUStack TLS certificate
+  ansible.builtin.slurp:
+    src: "{{ gpustack_server_ingress_tls_dir }}/tls.crt"
+  register: gpustack_default_tls_cert
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  when:
+    - gpustack_gateway_https_enabled
+    - gpustack_server_ingress_tls_cert is none
+    - gpustack_server_ingress_tls_key is none
+
+- name: Read the default GPUStack TLS private key
+  ansible.builtin.slurp:
+    src: "{{ gpustack_server_ingress_tls_dir }}/tls.key"
+  register: gpustack_default_tls_key
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  when:
+    - gpustack_gateway_https_enabled
+    - gpustack_server_ingress_tls_cert is none
+    - gpustack_server_ingress_tls_key is none
+
+- name: Set the effective GPUStack TLS values
+  ansible.builtin.set_fact:
+    gpustack_server_ingress_tls_cert_effective: "{{ gpustack_server_ingress_tls_cert if gpustack_server_ingress_tls_cert is not none else (gpustack_default_tls_cert.content | b64decode) }}"
+    gpustack_server_ingress_tls_key_effective: "{{ gpustack_server_ingress_tls_key if gpustack_server_ingress_tls_key is not none else (gpustack_default_tls_key.content | b64decode) }}"
+  run_once: true
+  when: gpustack_gateway_https_enabled
+
+- name: Render GPUStack Helm values
+  ansible.builtin.template:
+    src: values-maas-test.yaml.j2
+    dest: "{{ gpustack_values_path }}"
+    mode: '0644'
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Create the NVIDIA RuntimeClass
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+    state: present
+    definition:
+      apiVersion: node.k8s.io/v1
+      kind: RuntimeClass
+      metadata:
+        name: nvidia
+      handler: nvidia
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Read the NVIDIA RuntimeClass
+  kubernetes.core.k8s_info:
+    api_version: node.k8s.io/v1
+    kind: RuntimeClass
+    name: nvidia
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+  register: nvidia_runtimeclass
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Verify the NVIDIA RuntimeClass handler
+  ansible.builtin.assert:
+    that:
+      - nvidia_runtimeclass.resources | length == 1
+      - nvidia_runtimeclass.resources[0].handler == 'nvidia'
+    fail_msg: >-
+      RuntimeClass/nvidia is missing or has a handler other than 'nvidia'.
+  run_once: true
+
+# This validation intentionally does not set resources.limits.nvidia.com/gpu.
+# That extended resource is advertised by the NVIDIA device plugin, which is
+# not installed here because GPUStack manages GPU workers itself. RuntimeClass
+# plus CDI is the path being tested.
+- name: Remove any previous NVIDIA GPU test pod
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+    state: absent
+    api_version: v1
+    kind: Pod
+    name: "{{ nvidia_gpu_test_pod_name }}"
+    namespace: "{{ nvidia_gpu_test_namespace }}"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Create the NVIDIA GPU test pod
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: "{{ nvidia_gpu_test_pod_name }}"
+        namespace: "{{ nvidia_gpu_test_namespace }}"
+      spec:
+        restartPolicy: Never
+        runtimeClassName: nvidia
+        containers:
+          - name: nvidia-smi
+            image: "{{ nvidia_gpu_test_image }}"
+            command:
+              - nvidia-smi
+            env:
+              - name: NVIDIA_VISIBLE_DEVICES
+                value: all
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Wait for the NVIDIA GPU test pod to finish
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - wait
+      - "--namespace={{ nvidia_gpu_test_namespace }}"
+      - --for=jsonpath={.status.phase}=Succeeded
+      - "pod/{{ nvidia_gpu_test_pod_name }}"
+      - "--timeout={{ nvidia_gpu_test_timeout }}s"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  changed_when: false
+
+- name: Read the NVIDIA GPU test output
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - logs
+      - "--namespace={{ nvidia_gpu_test_namespace }}"
+      - "pod/{{ nvidia_gpu_test_pod_name }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: nvidia_gpu_test_output
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  changed_when: false
+
+- name: Verify the NVIDIA GPU test output
+  ansible.builtin.assert:
+    that:
+      - nvidia_gpu_test_output.stdout is search(nvidia_gpu_test_expected_gpu)
+    fail_msg: >-
+      NVIDIA GPU test did not report the expected GPU
+      '{{ nvidia_gpu_test_expected_gpu }}'. Output:
+      {{ nvidia_gpu_test_output.stdout }}
+  run_once: true
+
+- name: Show the NVIDIA GPU test output
+  ansible.builtin.debug:
+    msg: "{{ nvidia_gpu_test_output.stdout_lines }}"
+  run_once: true
+
+- name: Remove the NVIDIA GPU test pod
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+    state: absent
+    api_version: v1
+    kind: Pod
+    name: "{{ nvidia_gpu_test_pod_name }}"
+    namespace: "{{ nvidia_gpu_test_namespace }}"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+# A release left in a pending-* state by an interrupted or timed-out run blocks
+# every later operation: Helm skips the hooks, so the operator is never applied
+# and the failure is silent. Detect it and stop with an actionable message.
+- name: Read the GPUStack Helm release state
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/helm"
+      - status
+      - "{{ gpustack_release_name }}"
+      - "--namespace={{ gpustack_namespace }}"
+      - "--output=json"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: gpustack_release_status
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  changed_when: false
+  failed_when: false
+
+- name: Fail when the GPUStack Helm release is stuck in a pending state
+  ansible.builtin.fail:
+    msg: >-
+      Helm release {{ gpustack_release_name }} is
+      '{{ (gpustack_release_status.stdout | from_json).info.status }}'. Helm does
+      not run hooks in this state, so the GPUStack operator is never applied.
+      Resolve it first, for example:
+      helm uninstall {{ gpustack_release_name }} -n {{ gpustack_namespace }} --no-hooks
+  run_once: true
+  when:
+    - gpustack_release_status.rc == 0
+    - (gpustack_release_status.stdout | from_json).info.status is search('^pending-')
+
+- name: Install or upgrade GPUStack with Helm
+  kubernetes.core.helm:
+    kubeconfig: "{{ kube_config_dir }}/admin.conf"
+    binary_path: "{{ bin_dir }}/helm"
+    release_name: "{{ gpustack_release_name }}"
+    release_namespace: "{{ gpustack_namespace }}"
+    create_namespace: true
+    chart_ref: "{{ gpustack_chart_path }}"
+    release_state: present
+    values_files:
+      - "{{ gpustack_values_path }}"
+    wait: "{{ gpustack_helm_wait }}"
+    timeout: "{{ gpustack_helm_timeout }}"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+
+- name: Wait for the NVIDIA GPUStack worker DaemonSet
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - rollout
+      - status
+      - daemonset/{{ gpustack_release_name }}-worker-nvidia
+      - "--namespace={{ gpustack_namespace }}"
+      - "--timeout={{ gpustack_worker_timeout }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  changed_when: false
+
+- name: Show GPUStack component status
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - get
+      - pods
+      - "--namespace={{ gpustack_namespace }}"
+      - -o
+      - wide
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: gpustack_pod_status
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  changed_when: false
+
+- name: Display GPUStack component status
+  ansible.builtin.debug:
+    msg: "{{ gpustack_pod_status.stdout_lines }}"
+  run_once: true

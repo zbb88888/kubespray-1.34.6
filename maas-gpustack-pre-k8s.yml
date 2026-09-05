@@ -1,0 +1,33 @@
+---
+- name: Install the NVIDIA driver on the source node
+  hosts: kube_node[0]
+  become: true
+  vars:
+    maas_gpustack_phase: source
+  roles:
+    - maas-gpustack
+
+- name: Align NVIDIA packages across the cluster
+  hosts: kube_node
+  become: true
+  vars:
+    maas_gpustack_phase: sync
+  roles:
+    - maas-gpustack
+
+- name: Reboot nodes after NVIDIA driver changes
+  hosts: kube_node
+  serial: 1
+  become: true
+  vars:
+    maas_gpustack_phase: reboot
+  roles:
+    - maas-gpustack
+
+- name: Verify pure-DKMS state after reboot
+  hosts: kube_node
+  become: true
+  vars:
+    maas_gpustack_phase: verify
+  roles:
+    - maas-gpustack

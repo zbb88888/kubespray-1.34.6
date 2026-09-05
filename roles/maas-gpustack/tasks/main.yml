@@ -1,0 +1,40 @@
+---
+- name: Select the first Kubernetes node as the driver source
+  ansible.builtin.set_fact:
+    nvidia_driver_source: "{{ nvidia_driver_source | default(groups['kube_node'][0]) }}"
+
+- name: Install and identify the source-node driver
+  ansible.builtin.include_tasks: nvidia-source.yml
+  when: maas_gpustack_phase == 'source'
+
+- name: Compare and synchronize NVIDIA packages
+  ansible.builtin.include_tasks: nvidia-sync.yml
+  when: maas_gpustack_phase == 'sync'
+
+- name: Reboot nodes when required
+  ansible.builtin.include_tasks: nvidia-driver-update-reboot.yml
+  when: maas_gpustack_phase == 'reboot'
+
+- name: Verify the post-reboot pure-DKMS state
+  ansible.builtin.include_tasks: nvidia-verify-dkms.yml
+  when: maas_gpustack_phase == 'verify'
+
+- name: Install NVIDIA Container Toolkit
+  ansible.builtin.include_tasks: nvidia-container-toolkit.yml
+  when: maas_gpustack_phase == 'toolkit'
+
+- name: Flush containerd handlers before GPUStack installation
+  ansible.builtin.meta: flush_handlers
+  when: maas_gpustack_phase == 'toolkit'
+
+- name: Install GPUStack
+  ansible.builtin.include_tasks: gpustack.yml
+  when: maas_gpustack_phase == 'gpustack'
+
+- name: Check GPUStack components
+  ansible.builtin.include_tasks: check-gpustack.yml
+  when: maas_gpustack_phase == 'check'
+
+- name: Print GPUStack access information
+  ansible.builtin.include_tasks: gpustack-access.yml
+  when: maas_gpustack_phase == 'access'

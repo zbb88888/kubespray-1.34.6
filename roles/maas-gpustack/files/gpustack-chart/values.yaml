@@ -1,0 +1,305 @@
+# Default values for gpustack.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+debug: false
+# registrationToken is used to authenticate workers with the server.
+# If null, a random 32-character token is generated on first install and reused on upgrades.
+registrationToken: null
+# Global values are propagated to all sub-charts (Helm convention).
+# `global.hub` is the container registry host (e.g. docker.io).
+# For air-gapped or private registry installs, override:
+#   --set global.hub=myregistry.example.com
+#
+# `global.imagePullSecrets` is the list of Secret references attached to every
+# pod created by this chart and propagated to sub-charts (higress-core,
+# gpustack-enterprise) that follow the same convention. Defaults to a single
+# entry pointing at the canonical `gpustack-image-pull-secret` that this chart
+# auto-creates (see `imagePullSecret` below).
+#
+# To reference your own pre-existing Secrets, replace the list entirely:
+#   global:
+#     imagePullSecrets:
+#       - name: my-existing-secret
+#       - name: another-secret
+# When the list no longer references `gpustack-image-pull-secret` and no
+# credentials are provided below, the chart skips creating the canonical
+# Secret to avoid leaving an unused resource behind.
+global:
+  hub: docker.io
+  imagePullSecrets:
+    - name: gpustack-image-pull-secret
+  # Default nodeSelector applied to every GPUStack component (server + worker)
+  # when no component-level nodeSelector is provided. Component-level
+  # `server.nodeSelector` / `worker.nodeSelector`, when non-empty, REPLACE
+  # this value entirely (no merging).
+  nodeSelector: {}
+
+# Auto-creation of the canonical `gpustack-image-pull-secret` docker-registry
+# Secret. The Secret is created when either:
+#   - `credentials.username` and `credentials.password` are set (populated
+#     `.dockerconfigjson`), or
+#   - `global.imagePullSecrets` above still references the canonical name
+#     (created with an empty `{"auths":{}}` — harmless to reference, useful as
+#     a placeholder when no credentials are needed).
+# If the user fully swaps `global.imagePullSecrets` to externally managed
+# Secrets AND provides no credentials here, the canonical Secret is not
+# created.
+imagePullSecret:
+  credentials:
+    registry: docker.io
+    username: null
+    password: null
+    email: null
+image:
+  # Image repository including namespace (no registry). The final reference is
+  # rendered as `{global.hub}/{image.repository}:{image.tag}`.
+  repository: gpustack/gpustack
+  tag: null
+  pullPolicy: IfNotPresent
+server:
+  ingress:
+    # example: gpustack.example.com
+    hostname: null
+    tls:
+      # if tls.cert and tls.key are set, the schema will be https
+      cert: null
+      # cert: |-
+      #   -----BEGIN CERTIFICATE-----
+      #   MIID...
+      #   -----END CERTIFICATE-----
+      key: null
+      # key: |-
+      #   -----BEGIN PRIVATE KEY-----
+      #   MIIE...
+      #   -----END PRIVATE KEY-----
+
+  # if you have an existing database, set externalDatabaseURL to its connection string
+  # e.g. postgresql://user:password@hostname:port/dbname
+  externalDatabaseURL: null
+  dataVolume:
+    hostPath: null
+    size: 100Gi
+  apiPort: 30080
+  metricsPort: 10161
+  # Shared initial admin password across server replicas. Creates a Secret so
+  # every replica bootstraps the same admin password behind the load balancer.
+  # Only needed for multi-replica (HA) setups; single-node installs generate a
+  # per-node password without it. Enterprise enables this by default.
+  bootstrapPasswordSecret:
+    enabled: false
+    # Pin a known initial password. When set, it is injected into every replica
+    # as GPUSTACK_BOOTSTRAP_PASSWORD and treated as operator-chosen: no forced
+    # first-login change and no password-retrieval guide (same behavior as
+    # --bootstrap-password on CLI/Docker).
+    #
+    # Leave null to auto-generate a random password instead. The random value is
+    # mounted as a shared file on every replica so all of them show the same
+    # first-login retrieval guide, and forces a first-login change.
+    #
+    # GitOps note (auto-generated case only): the random value is kept stable
+    # across upgrades via Helm's `lookup`, which cannot read the cluster during
+    # template rendering (ArgoCD/Flux, `helm template`). In those environments a
+    # new random value is produced on every sync; set a static `password` here
+    # to pin it.
+    password: null
+  environmentConfig: {}
+  # Extra volume mounts for the server container. Use together with
+  # `extraVolumes` to mount additional files into the server pod, e.g. a
+  # private/self-signed CA into /usr/local/share/ca-certificates/ so that
+  # gpustack-prerun.sh merges it into the OS CA bundle at startup.
+  extraVolumeMounts: []
+  # - name: private-ca
+  #   mountPath: /usr/local/share/ca-certificates/my-ca.crt
+  #   subPath: my-ca.crt
+  #   readOnly: true
+  extraVolumes: []
+  # - name: private-ca
+  #   configMap:
+  #     name: private-ca
+  # Node selector for the server pod. When non-empty, REPLACES
+  # `global.nodeSelector` entirely (no merging). Leave empty/null to fall
+  # back to `global.nodeSelector`.
+  nodeSelector: {}
+  # Affinity for the server pod. When non-empty, REPLACES the built-in default
+  # entirely (no merging). Leave empty/null to use the default: when
+  # `replicas > 1`, a hard (required) podAntiAffinity by `kubernetes.io/hostname`
+  # spreads replicas across nodes so a single node failure only takes down one
+  # replica. NOTE: the hard rule requires at least as many schedulable nodes as
+  # replicas, otherwise extra replicas stay Pending; override this knob (e.g.
+  # with a `preferred` rule) for smaller clusters.
+  affinity: {}
+  # Server pod probes. Each is rendered verbatim when non-empty; set to null/{}
+  # to disable a probe. The server only starts serving HTTP after DB migrations
+  # and init complete, so the startupProbe (up to ~300s here) guards the
+  # slow-start window before livenessProbe takes over — increase its
+  # `failureThreshold` for slow/remote databases. Ports refer to the container's
+  # named `http` port.
+  startupProbe:
+    httpGet:
+      path: /healthz
+      port: http
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 30
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+    successThreshold: 1
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 5
+    successThreshold: 1
+clusterDomain: cluster.local
+gateway:
+  # IngressClass name for the Higress gateway; GPUStack checks if it exists in the cluster to enable in-cluster gateway mode
+  ingressClassname: higress
+
+# higress-core sub-chart configuration.
+# Set enabled: true to deploy Higress gateway alongside GPUStack.
+# If you already have Higress installed in the cluster, leave this disabled
+# and ensure gateway.ingressClassname matches your existing Higress instance.
+# Full list of available values: https://higress.io/helm-charts
+higress-core:
+  enabled: true
+  global:
+    # Must match gateway.ingressClassname above
+    ingressClass: higress
+    # GPUStack manages its own plugin server; disable the built-in one
+    enablePluginServer: false
+    # `hub` is inherited from the top-level `global.hub` via Helm's
+    # global-values propagation. Override here only when higress images
+    # live in a different registry than the rest of GPUStack.
+  downstream:
+    idleTimeout: 1800
+  upstream:
+    idleTimeout: 3
+  gateway:
+    # Empty string (not null): a literal `null` in a values file no longer
+    # overrides the subchart's default under Helm v4's coalesce semantics
+    # (only `--set ...=null` deletes). "" reliably falls through to
+    # `.Values.global.hub` on both Helm v3 and v4.
+    hub: ""
+    image: gpustack/mirrored-higress-gateway
+    imagePullSecrets:
+      - name: gpustack-image-pull-secret
+
+    service:
+      # Preserve real client IP at the gateway (required for IP-based
+      # rate limiting, audit logging, and X-Forwarded-For correctness).
+      # Note: when Service type is LoadBalancer/NodePort, ensure the
+      # external LB performs health checks against healthCheckNodePort,
+      # otherwise nodes without a gateway pod will drop traffic.
+      externalTrafficPolicy: Local
+  controller:
+    hub: ""
+    image: gpustack/mirrored-higress-higress
+    imagePullSecrets:
+      - name: gpustack-image-pull-secret
+  pilot:
+    hub: ""
+    image: gpustack/mirrored-higress-pilot
+higressPlugins:
+  # Number of higress-plugins deployment replicas.
+  replicas: 1
+  image:
+    # Image repository including namespace (no registry); final reference is `{global.hub}/{repository}:{tag}`.
+    repository: gpustack/higress-plugins
+    pullPolicy: IfNotPresent
+    tag: "0.3.0.post8"
+worker:
+  enabled: false
+  # GPU vendors for the worker nodes. Accepts a list to allow a single
+  # cluster to schedule workers for multiple runtimes side-by-side.
+  # Controls per-DaemonSet driver volume mounts and runtimeClassName.
+  # Supported values (per entry):
+  #   nvidia    - NVIDIA GPU; sets runtimeClassName to "nvidia"
+  #   mthreads  - Moore Threads GPU; sets runtimeClassName to "mthreads"
+  #   amd       - AMD GPU (ROCm); mounts /opt/rocm and /opt/rocm/lib
+  #   ascend    - Huawei Ascend NPU; mounts /usr/local/Ascend/driver and /usr/local/Ascend/ascend-toolkit
+  #   hygon     - Hygon DCU; mounts /opt/hyhal, /opt/dtk and /etc/dmi_mig_config
+  #   metax     - MetaX GPU; mounts /opt/mxdriver and /opt/maca
+  #   iluvatar  - Iluvatar GPU; mounts /usr/local/corex
+  #   cambricon - Cambricon MLU; mounts /usr/bin/cnmon and /usr/local/neuware
+  #   thead     - T-Head PPU; mounts /usr/local/PPU_SDK
+  #
+  # A CPU worker DaemonSet (`<release>-worker`) is always rendered and uses
+  # the nodeSelector `feature.gpustack.ai/acceleratable: "false"` to schedule
+  # onto non-acceleratable (CPU-only) nodes. It has no vendor-specific volume
+  # mounts or runtimeClassName.
+  #
+  # Rendering modes:
+  #   - [] (empty): only the CPU DaemonSet `<release>-worker` is rendered
+  #     (single mode — no vendor labels, no anti-affinity).
+  #   - 1+ entries: CPU DaemonSet `<release>-worker` plus one DaemonSet per
+  #     GPU vendor named `<release>-worker-<vendor>` (multi-vendor mode).
+  #     All worker pods get a required podAntiAffinity
+  #     (topologyKey=hostname, namespaceSelector={}) so two GPUStack worker
+  #     pods cannot share a node even across namespaces — protects the
+  #     `hostNetwork: true` ports from collision.
+  #
+  # Each GPU DaemonSet automatically receives a PCI-presence nodeSelector label
+  # (e.g. `feature.node.kubernetes.io/pci-10de.present: "true"` for NVIDIA)
+  # based on the vendor's PCI ID. These labels are advertised by Node Feature
+  # Discovery (NFD); NFD must be installed in the cluster for GPU workers to
+  # schedule onto GPU nodes.
+  gpuVendors:
+    - nvidia
+  # Base nodeSelector for ALL worker DaemonSets. When non-empty, REPLACES
+  # `global.nodeSelector` entirely (no merging with global). Leave empty
+  # to fall back to `global.nodeSelector`. Each DaemonSet additionally
+  # receives its vendor PCI-presence label merged on top (PCI label wins
+  # on conflict).
+  nodeSelector: {}
+  port: 10150
+  metricsPort: 10151
+  environmentConfig: {}
+  # Host path for worker data directory.
+  dataDir: /var/lib/gpustack
+  extraVolumeMounts: []
+  # - name: custom-lib
+  #   mountPath: /opt/custom/lib
+  #   readOnly: true
+  extraVolumes: []
+  # - name: custom-lib
+  #   hostPath:
+  #     path: /opt/custom/lib
+  #     type: DirectoryOrCreate
+operator:
+  # Operator manages worker DaemonSet lifecycle. Automatically enabled with
+  # worker.enabled=true — setting this manually is not needed in most cases.
+  image:
+    # Operator image repository including namespace (no registry).
+    # Final reference: {global.hub}/{operator.image.repository}:{operator.image.tag}
+    # Default tag is v0.8.6 — automatically patched by CI from __operator_version__
+    # in gpustack/__init__.py at build time.
+    repository: gpustack/gpustack-operator
+    tag: null
+    pullPolicy: IfNotPresent
+  # Additional environment variables for the operator container.
+  environmentConfig: {}
+  # Node selector for the operator pod. When non-empty, REPLACES
+  # global.nodeSelector entirely (no merging). Leave empty/null to fall
+  # back to global.nodeSelector.
+  nodeSelector: {}
+  # Operator container resource limits/requests.
+  resources:
+    limits:
+      cpu: "4"
+      memory: 8Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+  # Cert-manager TLS is auto-detected at runtime by the operator bootstrap Job
+  # (mirrors the Jinja template's apply.sh behavior). When cert-manager CRD
+  # `certificates.cert-manager.io` is found in the cluster, an Issuer and
+  # Certificate are created automatically. No user configuration needed.

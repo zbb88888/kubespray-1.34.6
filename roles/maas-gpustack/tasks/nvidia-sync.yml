@@ -1,0 +1,162 @@
+---
+- name: Collect the NVIDIA package state
+  ansible.builtin.shell: |
+    set -o pipefail
+    dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}=${Version}\n' 2>/dev/null |
+      awk '$1 == "ii" { print $2 }' |
+      grep -E '^(nvidia|libnvidia)' |
+      sort || true
+  args:
+    executable: /bin/bash
+  register: nvidia_installed_state
+  changed_when: false
+
+# Package identity is name plus architecture. The source version wins for
+# names it has; names absent from the source use the first discovered version.
+# Every node is brought up to that union. The pure-DKMS policy removes
+# linux-modules-nvidia-* packages in the explicit cleanup below.
+- name: Build the cluster-wide NVIDIA package alignment plan
+  ansible.builtin.set_fact:
+    nvidia_package_differences: >-
+      {%- set canonical = {} -%}
+      {%- for package in hostvars[nvidia_driver_source].nvidia_installed_state.stdout_lines | default([]) -%}
+      {%-   set _ = canonical.update({package.split('=')[0]: package}) -%}
+      {%- endfor -%}
+      {%- for node in groups['kube_node'] -%}
+      {%-   for package in hostvars[node].nvidia_installed_state.stdout_lines | default([]) -%}
+      {%-     if package.split('=')[0] not in canonical -%}
+      {%-       set _ = canonical.update({package.split('=')[0]: package}) -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%- endfor -%}
+      {%- set differences = {} -%}
+      {%- for node in groups['kube_node'] -%}
+      {%-   set installed = hostvars[node].nvidia_installed_state.stdout_lines | default([]) -%}
+      {%-   set install = [] -%}
+      {%-   for package in canonical.values() -%}
+      {%-     if package not in installed -%}
+      {%-       set _ = install.append(package) -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%-   if install | length > 0 -%}
+      {%-     set _ = differences.update({node: {'install': install}}) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ differences }}
+  delegate_to: localhost
+  delegate_facts: true
+  run_once: true
+
+- name: Show NVIDIA package alignment plan
+  ansible.builtin.debug:
+    msg:
+      install: "{{ hostvars['localhost'].nvidia_package_differences }}"
+      policy: >-
+        Same package name plus architecture uses the source version; package
+        names found on any node are installed on every node. Pure DKMS removes
+        linux-modules-nvidia-* after the alignment confirmation.
+  delegate_to: localhost
+  run_once: true
+
+- name: Ask before applying the NVIDIA package alignment plan
+  ansible.builtin.pause:
+    prompt: >-
+      NVIDIA package differences found: {{ hostvars['localhost'].nvidia_package_differences }}.
+      Type 'yes' to install missing packages on each node and align the cluster.
+  register: nvidia_sync_prompt
+  delegate_to: localhost
+  run_once: true
+  when: hostvars['localhost'].nvidia_package_differences | length > 0
+
+- name: Publish the sync confirmation on the controller
+  ansible.builtin.set_fact:
+    nvidia_sync_confirmed: "{{ nvidia_sync_prompt.user_input | default('') | lower == 'yes' }}"
+  delegate_to: localhost
+  delegate_facts: true
+  run_once: true
+  when: hostvars['localhost'].nvidia_package_differences | length > 0
+
+- name: Stop when the alignment plan was not confirmed
+  ansible.builtin.fail:
+    msg: >-
+      NVIDIA package differences exist but the alignment plan was not confirmed;
+      nothing was installed or removed. Re-run and type 'yes' to apply it.
+  run_once: true
+  when:
+    - hostvars['localhost'].nvidia_package_differences | length > 0
+    - not (hostvars['localhost'].nvidia_sync_confirmed | default(false))
+
+- name: Install NVIDIA packages missing from each node
+  ansible.builtin.apt:
+    name: "{{ item }}"
+    state: present
+    update_cache: true
+    install_recommends: false
+    allow_downgrade: true
+  loop: >-
+    {{ hostvars['localhost'].nvidia_package_differences
+       .get(inventory_hostname, {}).get('install', []) }}
+  loop_control:
+    label: "{{ item }}"
+  register: nvidia_package_install
+  when: hostvars['localhost'].nvidia_sync_confirmed | default(false)
+
+- name: Record package changes as requiring reboot
+  ansible.builtin.set_fact:
+    nvidia_reboot_required_by_role: true
+  when:
+    - inventory_hostname in hostvars['localhost'].nvidia_package_differences
+    - nvidia_package_install.changed | default(false)
+
+- name: Ensure the pure-DKMS driver package is installed
+  ansible.builtin.apt:
+    name: >-
+      {{ hostvars[nvidia_driver_source].nvidia_driver_package
+         | regex_replace('^nvidia-driver-', 'nvidia-dkms-') }}={{ hostvars[nvidia_driver_source].nvidia_driver_version }}
+    state: present
+    update_cache: true
+    install_recommends: false
+    allow_downgrade: true
+  register: nvidia_dkms_install
+  when:
+    - ansible_facts.distribution == 'Ubuntu'
+    - (hostvars['localhost'].nvidia_package_differences | default({}) | length == 0)
+      or hostvars['localhost'].nvidia_sync_confirmed | default(false)
+
+- name: Record DKMS package changes as requiring reboot
+  ansible.builtin.set_fact:
+    nvidia_reboot_required_by_role: true
+  when:
+    - nvidia_dkms_install.changed | default(false)
+
+- name: Collect precompiled NVIDIA kernel module packages
+  ansible.builtin.shell: |
+    dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 2>/dev/null |
+      awk '$1 == "ii" {print $2}' |
+      grep '^linux-modules-nvidia-' || true
+  args:
+    executable: /bin/bash
+  register: nvidia_precompiled_kernel_packages
+  changed_when: false
+  when: ansible_facts.distribution == 'Ubuntu'
+
+- name: Remove precompiled NVIDIA kernel modules for the pure-DKMS policy
+  ansible.builtin.apt:
+    name: "{{ item }}"
+    state: absent
+    purge: true
+  loop: "{{ nvidia_precompiled_kernel_packages.stdout_lines | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  register: nvidia_precompiled_module_removal
+  when:
+    - ansible_facts.distribution == 'Ubuntu'
+    - nvidia_precompiled_kernel_packages.stdout_lines | default([]) | length > 0
+    - (hostvars['localhost'].nvidia_package_differences | default({}) | length == 0)
+      or hostvars['localhost'].nvidia_sync_confirmed | default(false)
+
+- name: Record precompiled module removal as requiring reboot
+  ansible.builtin.set_fact:
+    nvidia_reboot_required_by_role: true
+  when:
+    - nvidia_precompiled_module_removal.changed | default(false)
