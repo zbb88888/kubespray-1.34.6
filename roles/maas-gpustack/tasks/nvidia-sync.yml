@@ -160,3 +160,44 @@
     nvidia_reboot_required_by_role: true
   when:
     - nvidia_precompiled_module_removal.changed | default(false)
+
+# Installing nvidia-dkms while linux-modules-nvidia-* is still present makes
+# DKMS skip its own install because it finds the same version already in the
+# kernel tree. The cleanup above then removes those precompiled modules and
+# leaves the running kernel without any NVIDIA module at all. Rebooting cannot
+# fix that; DKMS must be forced to install its own build afterwards.
+- name: Ensure DKMS modules are installed after precompiled module cleanup
+  ansible.builtin.shell: |
+    set -o pipefail
+    kernel="$(uname -r)"
+    dkms_status="$(dkms status 2>/dev/null || true)"
+    version="$(printf '%s\n' "$dkms_status" | awk -v k="$kernel" '
+      $1 ~ /^nvidia\// && index($0, k ",") {
+        module = $1
+        sub(",", "", module)
+        split(module, parts, "/")
+        print parts[2]
+        exit
+      }')"
+    if [ -z "$version" ]; then
+      # A node without an NVIDIA DKMS source needs no module reinstall.
+      exit 0
+    fi
+    if modinfo -F version nvidia 2>/dev/null | grep -qx "$version" &&
+       modinfo -F filename nvidia 2>/dev/null | grep -q '/updates/dkms/'; then
+      exit 0
+    fi
+    dkms install -m nvidia -v "$version" -k "$kernel" --force
+  args:
+    executable: /bin/bash
+  register: nvidia_dkms_reinstall
+  changed_when: "'Installing to /lib/modules/' in nvidia_dkms_reinstall.stdout"
+  when:
+    - ansible_facts.distribution == 'Ubuntu'
+    - (hostvars['localhost'].nvidia_package_differences | default({}) | length == 0)
+      or hostvars['localhost'].nvidia_sync_confirmed | default(false)
+
+- name: Record DKMS module reinstall as requiring reboot
+  ansible.builtin.set_fact:
+    nvidia_reboot_required_by_role: true
+  when: nvidia_dkms_reinstall.changed | default(false)

@@ -76,12 +76,32 @@
     - ansible_facts.distribution == 'Ubuntu'
     - inventory_hostname == nvidia_driver_source
 
+# The driver metapackage may resolve to the precompiled
+# linux-modules-nvidia-* alternative instead of DKMS. The sync phase assumes
+# the source node defines the DKMS version, so make the source node install
+# its matching nvidia-dkms-* package before the cluster-wide comparison runs.
+- name: Ensure the DKMS driver package is installed on the source node
+  ansible.builtin.apt:
+    name: >-
+      {{ (nvidia_source_package.stdout | trim).split()[0]
+         | regex_replace('^nvidia-driver-', 'nvidia-dkms-') }}={{ (nvidia_source_package.stdout | trim).split()[1] }}
+    state: present
+    update_cache: true
+    install_recommends: false
+    allow_downgrade: true
+  register: nvidia_source_dkms_install
+  when:
+    - ansible_facts.distribution == 'Ubuntu'
+    - inventory_hostname == nvidia_driver_source
+
 - name: Record source-node package changes as requiring reboot
   ansible.builtin.set_fact:
     nvidia_reboot_required_by_role: true
   when:
     - inventory_hostname == nvidia_driver_source
-    - (nvidia_source_install.changed | default(false)) or (nvidia_source_install_current.changed | default(false))
+    - (nvidia_source_install.changed | default(false))
+      or (nvidia_source_install_current.changed | default(false))
+      or (nvidia_source_dkms_install.changed | default(false))
 
 - name: Read every installed driver package on the source node
   ansible.builtin.shell: |

@@ -29,6 +29,9 @@
     nvidia_installed_driver_version: "{{ nvidia_installed_driver.stdout | trim | regex_search('^[0-9]+\\.[0-9]+') | default('', true) }}"
     nvidia_loaded_driver_version: "{{ nvidia_loaded_driver.stdout | trim | regex_search('^[0-9]+\\.[0-9]+') | default('', true) }}"
 
+# A version mismatch only justifies a reboot when this run changed the NVIDIA
+# packages or the system itself asked for one. Otherwise the node has already
+# been rebooted and a stale mismatch will never be fixed by rebooting again.
 - name: Determine why this node requires a reboot
   ansible.builtin.set_fact:
     nvidia_reboot_reasons: >-
@@ -39,16 +42,40 @@
       {%- if nvidia_reboot_required_by_role | default(false) -%}
       {%-   set _ = reasons.append('NVIDIA package state changed during this run') -%}
       {%- endif -%}
-      {%- if nvidia_installed_driver_version != '' and nvidia_loaded_driver_version == '' -%}
-      {%-   set _ = reasons.append('NVIDIA driver is installed but not loaded') -%}
-      {%- elif nvidia_installed_driver_version != '' and nvidia_installed_driver_version != nvidia_loaded_driver_version -%}
-      {%-   set _ = reasons.append('installed=' ~ nvidia_installed_driver_version ~ ', loaded=' ~ nvidia_loaded_driver_version) -%}
+      {%- set installed_but_not_loaded = nvidia_installed_driver_version != '' and nvidia_loaded_driver_version == '' -%}
+      {%- set versions_differ = nvidia_installed_driver_version != '' and nvidia_loaded_driver_version != '' and nvidia_installed_driver_version != nvidia_loaded_driver_version -%}
+      {%- if (installed_but_not_loaded or versions_differ) and (nvidia_reboot_required_by_role | default(false) or nvidia_reboot_required.stat.exists) -%}
+      {%-   if installed_but_not_loaded -%}
+      {%-     set _ = reasons.append('NVIDIA driver is installed but not loaded') -%}
+      {%-   else -%}
+      {%-     set _ = reasons.append('installed=' ~ nvidia_installed_driver_version ~ ', loaded=' ~ nvidia_loaded_driver_version) -%}
+      {%-   endif -%}
       {%- endif -%}
       {{ reasons }}
 
 - name: Decide whether this node requires a reboot
   ansible.builtin.set_fact:
     nvidia_reboot_needed: "{{ nvidia_reboot_reasons | length > 0 }}"
+
+- name: Stop when another reboot cannot resolve the driver mismatch
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} has installed NVIDIA driver
+      {{ nvidia_installed_driver_version }} but
+      {%- if nvidia_loaded_driver_version == '' %} no loaded driver was detected
+      {%- else %} the loaded driver is {{ nvidia_loaded_driver_version }}
+      {%- endif %}. /var/run/reboot-required is absent and no NVIDIA package was
+      changed during this run, so rebooting again is not the fix. Inspect the DKMS
+      state with `dkms status`, the module version with
+      `modinfo -F version nvidia`, and kernel module errors with
+      `journalctl -k | grep -i nvidia`. If the module file exists but is not
+      loaded, try `modprobe nvidia && nvidia-smi`; Secure Boot/MOK enrollment
+      is a common cause when the module cannot be loaded.
+  when:
+    - nvidia_installed_driver_version != ''
+    - nvidia_loaded_driver_version != nvidia_installed_driver_version
+    - not nvidia_reboot_required.stat.exists
+    - not (nvidia_reboot_required_by_role | default(false))
 
 - name: Ask before rebooting this node
   ansible.builtin.pause:
@@ -69,7 +96,10 @@
 
 - name: Stop if reboot was declined
   ansible.builtin.fail:
-    msg: "Reboot required for {{ inventory_hostname }}; reboot declined. Run the role again after reboot."
+    msg: >-
+      Reboot required for {{ inventory_hostname }}:
+      {{ nvidia_reboot_reasons | join('; ') }}.
+      Reboot declined. Re-run the role after a real reboot.
   when:
     - nvidia_reboot_needed
     - nvidia_reboot_confirmation.user_input | default('') | lower != 'yes'
