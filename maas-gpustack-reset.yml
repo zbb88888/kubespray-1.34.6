@@ -17,6 +17,15 @@
   roles:
     - maas-gpustack
 
+- name: Install NVIDIA Container Toolkit before GPUStack
+  hosts: kube_node
+  serial: 1
+  become: true
+  vars:
+    maas_gpustack_phase: toolkit
+  roles:
+    - maas-gpustack
+
 - name: Install GPUStack from scratch
   hosts: kube_node
   become: true
