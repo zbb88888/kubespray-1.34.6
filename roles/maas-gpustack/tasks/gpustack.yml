@@ -24,6 +24,18 @@
       the GPUStack NVIDIA worker DaemonSet would stay unscheduled.
   run_once: true
 
+# The kubernetes.core modules run on the control-plane node through that node's
+# own Python interpreter, not through the Ansible controller's virtualenv.
+- name: Ensure the Kubernetes Python client is available on the control-plane node
+  ansible.builtin.apt:
+    name: python3-kubernetes
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  when: ansible_facts.distribution == 'Ubuntu'
+
 - name: Label GPU nodes for GPUStack NVIDIA workers
   kubernetes.core.k8s:
     kubeconfig: "{{ kube_config_dir }}/admin.conf"
