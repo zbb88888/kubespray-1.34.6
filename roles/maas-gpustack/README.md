@@ -15,9 +15,13 @@ values 模板显式固定 GPUStack、Higress plugins 和 operator 镜像版本�
   required for GPUStack.
 - Kubernetes DNS suffix is `cluster.local`.
 - `containerd` is the Kubernetes CRI.
-- NFD is enabled by Kubespray.
+- NFD 由 GPUStack operator 自行安装，不作为 Kubespray 前置条件。实测：本场景
+  inventory 里 `node_feature_discovery_enabled: false`（Kubespray 不装），NFD 由
+  operator 的 Helm release `gpustack-operator-device-manager` 引入
+  （chart `node-feature-discovery-0.19.0`），命名空间为 `gpustack-system`。
 - The pre-Kubernetes phase installs and aligns NVIDIA drivers on Ubuntu GPU nodes;
-  the post-Kubernetes phase installs NVIDIA Container Toolkit.
+  the post-Kubernetes phase installs NVIDIA Container Toolkit. 驱动安装方式
+  （已选定 Ubuntu restricted 预编译路线）与验收命令见 `GPU-Driver.md`。
 - NVIDIA GPU Operator and Kubespray's NVIDIA accelerator/device-plugin are not
   installed; GPUStack manages its Kubernetes workers.
 - The source chart needs `operator.image.tag`; the values template pins it to
@@ -98,6 +102,17 @@ maas-cloudnative-pg 的 TODO。
 `max_connections` 为 100。Server 扩到 3 副本前必须先调大 `cnpg_max_connections`
 （连同内存）或引入 PgBouncer。
 
+已在 `inventory/maas-ha01`（三节点）完整验证：
+
+- `maas-gpustack-post-k8s.yml` 跡连跑两次，第二次仅剩固有变更（NVIDIA 测试 Pod
+  的创建/删除，以及 `kubectl scale` 总是报 scaled），Server Pod 未重建
+- `server-config` ConfigMap 中 `DATABASE_URL` 计数为 0，凭据只在
+  `gpustack-database` Secret 中；渲染出的 values 文件权限 0600
+- 删除 `gpustack-server-0` 后自动重建，数据（3 workers / 2 models / 4 api_keys）
+  完整，Pod 内不再启动内置 PostgreSQL
+- 删掉 PostgreSQL 主库触发切换后，Server 重建 27 个连接并恢复写入，
+  `restarts=0`，日志无 `OperationalError`，`/healthz` 为 200
+
 ### 2. GPUStack Helm 内的 Kubernetes 控制面
 
 GPUStack Helm release 内直接管理的控制面组件，支持主备的统一部署为至少两个
@@ -162,14 +177,16 @@ PostgreSQL 外，还必须提供 GPUStack 分布式 Coordinator，用于 Leader 
 
 Task 按职责拆分在 `tasks/check-gpustack.yml`、
 `tasks/nvidia-container-toolkit.yml`、
-`tasks/nvidia-source.yml`、`tasks/nvidia-sync.yml`、
+`tasks/nvidia-preinstall-install.yml`、`tasks/nvidia-preinstall-check.yml`、
+`tasks/nvidia-preinstall-source.yml`、`tasks/nvidia-preinstall-reboot-verify.yml`、
+`tasks/nvidia-preinstall-rollout.yml`、`tasks/nvidia-preinstall-verify.yml`、
 `tasks/nvidia-driver-update-reboot.yml` 和 `tasks/gpustack.yml`；
-`tasks/main.yml` 按阶段 include。
+`tasks/main.yml` 按阶段 include。驱动路线、包集合与验收标准见 `GPU-Driver.md`。
 
 部署分为两个独立 playbook：`maas-gpustack-pre-k8s.yml` 在 Kubernetes 部署前
-安装并对齐 NVIDIA 驱动；`maas-gpustack-post-k8s.yml` 在 Kubernetes 部署完成后
-安装 NVIDIA Container Toolkit，并通过 Helm 部署 GPUStack。驱动重启单独使用
-`reboot` phase 按节点处理。两个 playbook 共享同一个 `maas-gpustack` role，不复制 role 实现。
+安装 NVIDIA 预编译驱动并逐台重启验收；`maas-gpustack-post-k8s.yml` 在 Kubernetes
+部署完成后安装 NVIDIA Container Toolkit，并通过 Helm 部署 GPUStack。
+两个 playbook 共享同一个 `maas-gpustack` role，不复制 role 实现。
 
 确认 CRI 配置：
 
@@ -192,46 +209,41 @@ ansible-playbook -i inventory/maas-test/inventory.ini \
   --become --become-user=root maas-gpustack-post-k8s.yml
 ```
 
-前置 playbook 按顺序使用 `source`、`sync`、`reboot` 和 `verify` 四个 phase：先只处理
-`kube_node[0]`，再对齐其他节点，最后逐台处理重启；后置 playbook 使用
-`post_k8s` phase。role 本身不拆分。直接引用 role 时必须显式设置
-`maas_gpustack_phase`。
+前置 playbook 按顺序使用 `source`、`source_verify`、`rollout` 和 `verify` 四个
+phase：先在第一台节点安装，再重启并验收它，然后逐台处理其余节点，最后全集群终验；
+后置 playbook 使用 `toolkit`、`gpustack`、`check` 和 `access` phase。role 本身不
+拆分。直接引用 role 时必须显式设置 `maas_gpustack_phase`，取值非法会立即失败。
 
-Role 执行：
+Role 执行（预编译路线）：
 
 ```text
-使用 kube_node[0] 作为驱动版本源节点；每次前置执行先单独处理该节点。
-源节点没有已安装驱动时执行 ubuntu-drivers install；已有驱动时读取当前包名和版本，
-使用 `name=当前包名=当前版本`、`state=present` 确保该精确版本存在，不使用
-`reinstall`，也不解析或升级到仓库最新版本。
-读取源节点的 nvidia-driver-* 精确包名和版本
-推导唯一规范驱动分支号（如 595）
-比较 NVIDIA 包集合，包括 `nvidia-*` 和 `libnvidia-*`。生产策略为纯 DKMS：
-`linux-modules-nvidia-*` 预编译内核模块不作为目标包保留，确认后会从每个 Ubuntu 节点
-删除；随后通过 `dkms status` 和 `modinfo` 检查 `nvidia`、`nvidia_modeset`、
-`nvidia_drm` 和 `nvidia_uvm` 的模块路径必须位于 `updates/dkms`，防止 DKMS 与预编译
-模块混用。任一节点未满足时，流程停止。同步规则是：先按包名（含架构）建立集群包集合；
-同名包在源节点存在时，以源节点版本为准；
-源节点不存在的包，以其他节点已存在的版本为准并补充到所有节点；除明确的
-`linux-modules-nvidia-*` 纯 DKMS 清理外，不删除其他 NVIDIA 包。确认后仅按节点差异逐个安装缺失包。
-检测 /var/run/reboot-required 或“已安装版本 != 已加载版本”
-仅对需要重启的节点逐台确认并重启
+使用 kube_node[0] 作为金丝雀节点，每次前置执行先单独处理它。
+第一阶段 source：在第一台节点安装 Ubuntu restricted 的预编译内核模块追踪包
+（linux-modules-nvidia-<series>-<variant>-<flavor>）、运行 ABI 载荷包和用户态元包
+（nvidia-driver-<series>-<variant>），并移除 Linux 包 nvidia-dkms-<series>-<variant>。
+nvidia-kernel-source-* 由用户态元包依赖保留，但它不注册 DKMS，也不参与构建。
+第二阶段 source_verify：按需重启该节点并做完整验收，可反复执行。
+第三阶段 rollout：其余节点逐台执行同一安装与验收，serial: 1 保证一次一台，
+any_errors_fatal 保证任何一台失败立即停止；每批开始前先复核金丝雀节点。
+第四阶段 verify：全集群只读终验，并断言所有 GPU 节点落在同一驱动版本上。
+重启判定依据：/var/run/reboot-required 存在、本次运行改动过 NVIDIA 包、
+运行内核的 nvidia 模块文件比本次启动更新（提供者已切换），或已安装版本 != 已加载版本。
 ```
 
-这样不会接受同一集群中 580/595 等驱动版本混用，也会识别 595 驱动中残留的
-580 版 `libnvidia-*` 或 `nvidia-firmware-*` 包。同步时保留目标节点已有的包，并按
-上述规则补齐全局包集合；纯 DKMS 策略会删除 `linux-modules-nvidia-*`。Role 不安装 NVIDIA GPU Operator
-或 Kubernetes NVIDIA device plugin，也不会删除 nvidia-prime、nvidia-settings 等
-不带驱动分支号的组件。
+验收断言（任一不满足即停止）：内核模块路径必须位于
+`/lib/modules/<abi>/kernel/nvidia-<series>-<variant>/`，不得指向 `updates/dkms`；
+不得存在任何 `nvidia-dkms-*` 包；运行内核 ABI 的载荷包必须已安装；模块版本与已加载
+驱动版本必须一致且属于目标系列（如 595）。Role 不安装 NVIDIA GPU Operator 或
+Kubernetes NVIDIA device plugin。
 
-`reboot` phase 按 `serial: 1` 逐台询问并自动重启，不会并行重启节点；随后 `verify`
-phase 在每个节点上验证 DKMS 模块路径和无 `linux-modules-nvidia-*` 包。每台需要
-重启的节点都必须单独输入 `yes`；输入其他内容会停止执行。
+每台需要重启的节点默认都要单独输入 `yes`（`nvidia_reboot_confirm: false` 可用于
+无人值守），输入其他内容会停止执行。
 
 ## Before installing
 
 执行后置 playbook 前，必须使用目标 inventory，确认 Kubernetes 已部署完成、
-containerd 和 Helm 已安装，且 NFD 已运行。maas-test inventory 必须设置
+containerd 和 Helm 已安装。NFD 不需要预置：它由 GPUStack operator 在 gpustack
+阶段自行安装。maas-test inventory 必须设置
 `container_manager: containerd`；role 不再用默认值代替缺失配置。role 会自动下发内置
 chart 并创建 server 数据目录，无需手动执行
 `mkdir`。远端 chart 默认位于 `/tmp/gpustack-chart`。
@@ -241,7 +253,8 @@ Verify the cluster and GPU prerequisites:
 ```bash
 kubectl get nodes -o wide
 kubectl get pods -n kube-system -l k8s-app=calico-node
-kubectl get pods -n node-feature-discovery
+# NFD 由 GPUStack operator 安装到 gpustack-system，部署完成前不存在
+kubectl get pods -n gpustack-system -l app.kubernetes.io/name=node-feature-discovery
 kubectl get nodes --show-labels | grep feature.node.kubernetes.io
 kubectl delete pod nvidia-smi -n default --ignore-not-found
 kubectl get runtimeclass nvidia -o yaml
@@ -294,26 +307,23 @@ resources. The role reads the completed Pod logs and requires the expected GPU
 model (`nvidia_gpu_test_expected_gpu`, default `NVIDIA GeForce RTX 4090`) before
 installing GPUStack.
 
-### NVIDIA 包同步规则
+### NVIDIA 包安装规则
 
-`nvidia-sync.yml` 不把源节点的完整包列表直接作为所有节点的最终包列表，也不删除
-目标节点独有的包。它先建立集群包名（含架构）到 canonical 版本的映射：
+预编译路线的包集合由 `defaults/main.yml` 的变量决定（完整说明见
+`GPU-Driver.md` 第 7 节）：追踪包
+`linux-modules-nvidia-<series>-<variant>-<flavor>`、运行 ABI 的载荷包
+`linux-modules-nvidia-<series>-<variant>-<ansible_kernel>`、用户态元包
+`nvidia-driver-<series>-<variant>`，以及必须不存在的
+`nvidia-dkms-<series>-<variant>`。
 
-```text
-同名包在源节点存在：使用源节点的 name=version
-同名包仅在其他节点存在：使用第一个已发现的 name=version
-每台节点缺少的 canonical 包：逐包 apt state=present
-```
-
-因此：
-
-- 源节点缺少而其他节点存在的包，会补到源节点及所有缺失节点；
-- 其他节点缺少而源节点存在的包，会补到对应其他节点；
-- 同名包版本不同，会在目标节点安装源节点版本；
-- 任意节点已有但源节点没有的普通 NVIDIA 包不会被删除；
-- `linux-modules-nvidia-*` 是纯 DKMS 策略的唯一例外，会被清理；
-- 清理后 `modinfo` 必须确认核心 NVIDIA 模块来自 `updates/dkms`；
-- role 不对普通 NVIDIA 包执行 `purge`。
+- 追踪包是升级入口，负责内核 ABI 升级后自动指向新的载荷包；
+- 载荷包负责当前运行内核，避免切换期间运行内核失去模块；
+- `nvidia-dkms-*` 会被 `purge`，并由 apt 负向 pin 阻止被依赖解析装回；
+- `nvidia-kernel-source-*` 保留：用户态元包硬依赖它，且它不注册 DKMS、
+  不参与构建（`dkms.conf` 属于 `nvidia-dkms-*`）；
+- 验收要求模块路径位于 `/lib/modules/<abi>/kernel/nvidia-<series>-<variant>/`，
+  且不得存在任何 `nvidia-dkms-*` 包；
+- 全集群终验还要求所有 GPU 节点落在同一驱动版本上。
 
 ## Install
 
