@@ -55,16 +55,22 @@ playbook 只有一个 play，目标是 `kube_control_plane[0]`，执行顺序：
 
 ## 给 GPUStack 使用
 
-密码由 operator 生成在 `<cluster>-app` Secret 中，取连接串：
+`maas-gpustack` role 的 gpustack 阶段会自动读取 `pg-main-app` Secret 的 `fqdn-uri`
+写入 Helm values，无需手工配置，只需保证本 playbook 先于 GPUStack 执行。
+手工取连接串：
 
 ```bash
-kubectl -n pg get secret pg-main-app -o jsonpath='{.data.uri}' | base64 -d
-# postgresql://app:<password>@pg-main-rw.pg:5432/app
+kubectl -n pg get secret pg-main-app -o jsonpath='{.data.fqdn-uri}' | base64 -d
+# postgresql://app:<password>@pg-main-rw.pg.svc.cluster.local:5432/app
 ```
 
-GPUStack 侧配置 `server.externalDatabaseURL` 指向该地址。**必须用 `-rw` Service**：
-`-ro` 只连备库，`-r` 轮询全部，都不可写。主备切换后 `-rw` 自动指向新主，
-应用只需具备重连能力。
+跨 namespace 必须用 `fqdn-uri` 而不是 `uri`，后者只有短名，只在 `pg` namespace 内
+可解析。**必须用 `-rw` Service**：`-ro` 只连备库，`-r` 轮询全部，都不可写。
+主备切换后 `-rw` 自动指向新主，应用只需具备重连能力。
+
+实测单个 GPUStack Server 副本稳定占用 **27 个连接**。`max_connections` 为 100，
+因此 Server 最多能扩到 3 副本（约 81 连接），再多必须先调大
+`cnpg_max_connections` 和 `cnpg_resources_memory`，或引入 PgBouncer。
 
 ## 运维
 

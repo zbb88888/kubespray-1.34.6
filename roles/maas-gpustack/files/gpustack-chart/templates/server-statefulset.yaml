@@ -91,6 +91,11 @@ spec:
             - secretRef:
                 name: {{ .Release.Name }}-jwt-key
                 optional: false
+            {{- if .Values.server.externalDatabaseURL }}
+            - secretRef:
+                name: {{ .Release.Name }}-database
+                optional: false
+            {{- end }}
             - configMapRef:
                 name: server-config
                 optional: true

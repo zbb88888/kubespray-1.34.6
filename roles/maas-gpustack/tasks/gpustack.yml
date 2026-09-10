@@ -249,13 +249,59 @@
   run_once: true
   when: gpustack_gateway_https_enabled
 
+# The CloudNativePG secret holds the generated password, so the URL is read at
+# run time instead of being written into inventory. 'fqdn-uri' is the
+# namespace-qualified form the GPUStack namespace needs.
+- name: Read the external PostgreSQL connection string
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - get
+      - "secret/{{ gpustack_database_secret_name }}"
+      - "--namespace={{ gpustack_database_secret_namespace }}"
+      - -o
+      - jsonpath={.data.fqdn-uri}
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: gpustack_database_uri
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  changed_when: false
+  no_log: true
+  when:
+    - gpustack_external_database_url is none
+    - gpustack_database_secret_name is not none
+
+- name: Set the external PostgreSQL connection string
+  ansible.builtin.set_fact:
+    gpustack_external_database_url: "{{ gpustack_database_uri.stdout | b64decode }}"
+  run_once: true
+  no_log: true
+  when:
+    - gpustack_external_database_url is none
+    - gpustack_database_secret_name is not none
+    - gpustack_database_uri.stdout | default('') | length > 0
+
+- name: Verify the external PostgreSQL connection string was found
+  ansible.builtin.assert:
+    that:
+      - gpustack_external_database_url is not none
+    fail_msg: >-
+      Secret {{ gpustack_database_secret_namespace }}/{{ gpustack_database_secret_name }}
+      has no 'fqdn-uri' key. Run maas-cloudnative-pg.yml first, or set
+      gpustack_database_secret_name to null to use the PostgreSQL bundled in
+      the Server pod.
+  run_once: true
+  when: gpustack_database_secret_name is not none
+
 - name: Render GPUStack Helm values
   ansible.builtin.template:
     src: values-maas-test.yaml.j2
     dest: "{{ gpustack_values_path }}"
-    mode: '0644'
+    mode: '0600'
   delegate_to: "{{ groups['kube_control_plane'][0] }}"
   run_once: true
+  no_log: true
 
 - name: Create the NVIDIA RuntimeClass
   kubernetes.core.k8s:

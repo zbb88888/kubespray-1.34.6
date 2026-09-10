@@ -126,9 +126,6 @@ Pulls from `.Values.global.hub`, trimming any trailing slash for safe printf.
 GPUSTACK_DEBUG: "{{ .Values.debug }}"
 GPUSTACK_API_PORT: "{{ .Values.server.apiPort }}"
 GPUSTACK_METRICS_PORT: "{{ .Values.server.metricsPort }}"
-{{ if .Values.server.externalDatabaseURL -}}
-GPUSTACK_DATABASE_URL: "{{ .Values.server.externalDatabaseURL }}"
-{{- end }}
 {{- with .Values.server.environmentConfig }}
 {{- range $key, $value := . }}
 {{ $key }}: "{{ $value }}"

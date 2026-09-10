@@ -43,21 +43,60 @@ values 模板显式固定 GPUStack、Higress plugins 和 operator 镜像版本�
 
 后续高可用改造固定遵循下面的边界，新增组件或修改副本数时必须按此设计检查。
 
-### 1. 外部 PostgreSQL HA
+### 1. 外部 PostgreSQL HA（已落地）
 
 GPUStack 的业务数据库采用外部 PostgreSQL，不使用 Server Pod 内置的单实例
-PostgreSQL 作为生产 HA 数据库。PostgreSQL 由独立的 operator 或 Helm 方案维护，
-至少提供一个 Primary 和一个 Standby，并负责复制、故障检测和自动切换。生产环境
-优先使用具备稳定读写 Service 的方案，GPUStack 只配置该读写地址：
+PostgreSQL 作为生产 HA 数据库。数据库由 `maas-cloudnative-pg` role 部署：
+CloudNativePG operator 管理的一主两备，详见 `roles/maas-cloudnative-pg/README.md`。
 
-```yaml
-server:
-  externalDatabaseURL: postgresql://<user>:<password>@<postgres-rw>:5432/gpustack
+部署顺序上 PostgreSQL 在前：
+
+```bash
+ansible-playbook -i inventory/maas-ha01/inventory.ini maas-cloudnative-pg.yml -b
+ansible-playbook -i inventory/maas-ha01/inventory.ini maas-gpustack-post-k8s.yml -b
 ```
 
-PostgreSQL HA 是 GPUStack Server 多副本或 Server 故障恢复的前置条件。数据库方案
-还必须覆盖备份、恢复、凭据管理和数据库迁移的并发控制。MySQL 与 PostgreSQL
-二选一即可，当前部署方案选择 PostgreSQL，不同时部署两种数据库。
+连接串不写在 inventory 里。gpustack 阶段从 CloudNativePG 生成的 Secret 读取
+`fqdn-uri`（跨 namespace 需要带域名的地址），写入 Helm values 的
+`server.externalDatabaseURL`：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `gpustack_database_secret_namespace` | `pg` | CNPG 集群所在 namespace |
+| `gpustack_database_secret_name` | `pg-main-app` | 置 null 则回退到 Server 内置 PostgreSQL |
+| `gpustack_external_database_url` | null | 显式指定时跳过 Secret 读取，用于连接本集群不管理的数据库 |
+
+密码不落到 ConfigMap：上游 chart 把 `GPUSTACK_DATABASE_URL` 放在 `server-config`
+ConfigMap 里，该 ConfigMap 对 namespace 内任何有 get 权限的主体可读。随 role 交付的
+chart 已改为单独的 `<release>-database` Secret，通过 `envFrom.secretRef` 注入，
+仅在 `externalDatabaseURL` 非空时创建。
+
+从内置 PostgreSQL 迁移到外部数据库时，切换本身不搬数据，必须先导出再导入，
+否则 Server 会在空库上重建 schema，模型、用户和 API key 全部丢失：
+
+```bash
+# 1. 从 Server Pod 内置 PostgreSQL 导出
+kubectl -n gpustack-system exec gpustack-server-0 -- \
+  su postgres -c 'pg_dump -d gpustack -Fc -f /tmp/gpustack.dump'
+kubectl -n gpustack-system cp gpustack-server-0:/tmp/gpustack.dump /tmp/gpustack.dump
+
+# 2. 导入 CloudNativePG（CNPG Pod 的 /tmp 只读，走 stdin）
+P=$(kubectl -n pg get cluster pg-main -o jsonpath='{.status.currentPrimary}')
+PW=$(kubectl -n pg get secret pg-main-app -o jsonpath='{.data.password}' | base64 -d)
+kubectl -n pg exec -i "$P" -c postgres -- \
+  env PGPASSWORD="$PW" pg_restore --no-owner --no-acl -h pg-main-rw -U app -d app \
+  < /tmp/gpustack.dump
+
+# 3. 再跑 gpustack 阶段，Server 重建后不再启动内置 PostgreSQL
+```
+
+PostgreSQL HA 是 GPUStack Server 多副本或 Server 故障恢复的前置条件。MySQL 与
+PostgreSQL 二选一即可，当前部署方案选择 PostgreSQL。备份尚未配置，见
+maas-cloudnative-pg 的 TODO。
+
+**连接数需注意**：实测单个 Server 副本稳定占用 27 个连接，而数据库
+`max_connections` 为 100。Server 扩到 3 副本前必须先调大 `cnpg_max_connections`
+（连同内存）或引入 PgBouncer。
 
 ### 2. GPUStack Helm 内的 Kubernetes 控制面
 
