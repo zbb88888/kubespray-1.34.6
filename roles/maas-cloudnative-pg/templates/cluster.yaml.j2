@@ -1,0 +1,57 @@
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ cnpg_cluster_name }}
+  namespace: {{ cnpg_cluster_namespace }}
+spec:
+  instances: {{ cnpg_instances }}
+  imageName: {{ cnpg_postgres_image }}
+  # Minor-version upgrades roll the replicas, then switch over to a already
+  # upgraded standby instead of restarting the primary in place.
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+  # The postgres superuser stays disabled; applications use the app role.
+  enableSuperuserAccess: false
+  postgresql:
+    parameters:
+      max_connections: "{{ cnpg_max_connections }}"
+{% if cnpg_instances | int > 1 %}
+    synchronous:
+      method: any
+      number: {{ cnpg_synchronous_number }}
+{% endif %}
+  bootstrap:
+    initdb:
+      database: {{ cnpg_database }}
+      owner: {{ cnpg_owner }}
+  storage:
+    storageClass: {{ cnpg_storage_class }}
+    size: {{ cnpg_storage_size }}
+  walStorage:
+    storageClass: {{ cnpg_storage_class }}
+    size: {{ cnpg_wal_storage_size }}
+  resources:
+    requests:
+      cpu: "{{ cnpg_resources_cpu }}"
+      memory: {{ cnpg_resources_memory }}
+    limits:
+      cpu: "{{ cnpg_resources_cpu }}"
+      memory: {{ cnpg_resources_memory }}
+  affinity:
+{% if cnpg_instances | int > 1 %}
+    # One instance per node: a node failure must never take two instances.
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: required
+{% endif %}
+    nodeSelector:
+{{ cnpg_node_selector | to_nice_yaml | indent(6, true) }}
+    # The control-plane nodes are untainted today; the toleration keeps the
+    # workload schedulable if the standard taint is ever applied.
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+  monitoring:
+    enablePodMonitor: {{ cnpg_enable_pod_monitor | bool | lower }}

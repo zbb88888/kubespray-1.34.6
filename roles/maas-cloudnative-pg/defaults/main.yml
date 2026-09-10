@@ -1,0 +1,45 @@
+---
+# CloudNativePG operator release manifest. Pinned to v1.30.0; bump both the URL
+# and the branch when moving to another minor release.
+cnpg_manifest_url: https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.30/releases/cnpg-1.30.0.yaml
+cnpg_operator_namespace: cnpg-system
+cnpg_operator_timeout: 300s
+
+# PostgreSQL workload.
+cnpg_cluster_name: pg-main
+cnpg_cluster_namespace: pg
+# Pin the PostgreSQL image: the operator default moves with each operator
+# release, which would silently change the major version on upgrade.
+cnpg_postgres_image: ghcr.io/cloudnative-pg/postgresql:17.6-standard-bookworm
+cnpg_instances: 3
+cnpg_database: app
+cnpg_owner: app
+# Separate WAL volume so write bursts cannot fill the data volume.
+cnpg_storage_class: local-path
+cnpg_storage_size: 10Gi
+cnpg_wal_storage_size: 5Gi
+# requests == limits gives the Pods Guaranteed QoS, as recommended by CNPG.
+# GPUStack 元数据库，低 TPS。控制节点还要跑 apiserver/etcd/GPUStack，
+# 不占用用不上的额度。并发上来后再调大。
+cnpg_resources_cpu: 500m
+cnpg_resources_memory: 1Gi
+# The workload is pinned to the control-plane nodes.
+cnpg_node_selector:
+  node-role.kubernetes.io/control-plane: ""
+# 200 connections against 2Gi with no pooler risks OOM; PostgreSQL's own
+# default is 100. Raise it together with cnpg_resources_memory or a Pooler.
+cnpg_max_connections: 100
+# Quorum-based synchronous replication: a commit needs one standby. Ignored
+# when cnpg_instances is 1.
+cnpg_synchronous_number: 1
+# Requires the Prometheus operator CRDs; off until they are installed.
+cnpg_enable_pod_monitor: false
+cnpg_cluster_timeout: 600s
+cnpg_manifest_path: /tmp/cnpg-cluster.yaml
+# ponytail: 无备份。副本不防误删/逻辑损坏。TODO 后续实现
+# cnpg_dump_backup_enabled（默认 false）：每日 pg_dump CronJob 写节点本地目录，
+# 保留 30 天。上 S3 时改用 Barman Cloud 插件 + ObjectStore 取得 PITR。
+
+# Fallbacks for standalone runs; Kubespray's own defaults win when loaded.
+bin_dir: /usr/local/bin
+kube_config_dir: /etc/kubernetes

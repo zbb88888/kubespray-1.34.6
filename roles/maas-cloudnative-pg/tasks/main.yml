@@ -1,0 +1,176 @@
+---
+- name: Verify the PostgreSQL StorageClass exists
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - get
+      - "storageclass/{{ cnpg_storage_class }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: cnpg_storageclass
+  changed_when: false
+  failed_when: false
+
+- name: Fail when the PostgreSQL StorageClass is missing
+  ansible.builtin.assert:
+    that:
+      - cnpg_storageclass.rc == 0
+    fail_msg: >-
+      StorageClass '{{ cnpg_storage_class }}' does not exist. Set
+      local_path_provisioner_enabled: true in the inventory and run
+      cluster.yml --tags=local-path-provisioner, or point cnpg_storage_class
+      at an existing class.
+
+# Server-side apply: the CRDs carry schemas far larger than the 262kB
+# last-applied-configuration annotation a client-side apply would write.
+- name: Install the CloudNativePG operator
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - apply
+      - --server-side
+      - -f
+      - "{{ cnpg_manifest_url }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: cnpg_operator_apply
+  # kubectl prints 'serverside-applied' for every object whether or not it
+  # changed, so the output cannot tell an install from a no-op re-apply.
+  changed_when: false
+
+- name: Wait for the CloudNativePG operator to become available
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - wait
+      - "--namespace={{ cnpg_operator_namespace }}"
+      - --for=condition=Available
+      - deployment/cnpg-controller-manager
+      - "--timeout={{ cnpg_operator_timeout }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  changed_when: false
+
+- name: Render the PostgreSQL Cluster manifest
+  ansible.builtin.template:
+    src: cluster.yaml.j2
+    dest: "{{ cnpg_manifest_path }}"
+    mode: '0644'
+
+- name: Create the PostgreSQL namespace
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - create
+      - namespace
+      - "{{ cnpg_cluster_namespace }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: cnpg_namespace
+  changed_when: cnpg_namespace.rc == 0
+  failed_when: cnpg_namespace.rc != 0 and 'AlreadyExists' not in cnpg_namespace.stderr
+
+- name: Apply the PostgreSQL Cluster
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - apply
+      - -f
+      - "{{ cnpg_manifest_path }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: cnpg_cluster_apply
+  changed_when: cnpg_cluster_apply.stdout is search('(created|configured)$', multiline=True)
+
+- name: Wait for the PostgreSQL Cluster to become ready
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - wait
+      - "--namespace={{ cnpg_cluster_namespace }}"
+      - --for=condition=Ready
+      - "cluster/{{ cnpg_cluster_name }}"
+      - "--timeout={{ cnpg_cluster_timeout }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  changed_when: false
+
+# Ready stays True while an existing cluster rolls its instances, so a
+# configuration change would otherwise race the smoke test against a
+# restarting instance.
+- name: Wait for the PostgreSQL Cluster to report a healthy phase
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - wait
+      - "--namespace={{ cnpg_cluster_namespace }}"
+      - --for=jsonpath={.status.phase}=Cluster in healthy state
+      - "cluster/{{ cnpg_cluster_name }}"
+      - "--timeout={{ cnpg_cluster_timeout }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  changed_when: false
+
+- name: Read the current primary instance
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - get
+      - "cluster/{{ cnpg_cluster_name }}"
+      - "--namespace={{ cnpg_cluster_namespace }}"
+      - -o
+      - jsonpath={.status.currentPrimary}
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: cnpg_primary
+  changed_when: false
+
+# Smoke test through the -rw Service and the app role, which is the path the
+# applications use. A ready Cluster with an unusable app database is the
+# failure this catches. The table is dropped again so the application database
+# keeps no test leftovers.
+- name: Run a write and read smoke test against the read-write Service
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      {{ bin_dir }}/kubectl exec --namespace={{ cnpg_cluster_namespace }}
+      {{ cnpg_primary.stdout }} --container=postgres --
+      env PGPASSWORD="$({{ bin_dir }}/kubectl get secret
+      --namespace={{ cnpg_cluster_namespace }} {{ cnpg_cluster_name }}-app
+      -o jsonpath='{.data.password}' | base64 -d)"
+      psql -h {{ cnpg_cluster_name }}-rw -U {{ cnpg_owner }}
+      -d {{ cnpg_database }} -tAc
+      "CREATE TABLE cnpg_smoke (id int primary key);
+      INSERT INTO cnpg_smoke VALUES (1);
+      SELECT count(*) FROM cnpg_smoke;
+      DROP TABLE cnpg_smoke;"
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: cnpg_smoke
+  changed_when: false
+
+- name: Verify the smoke test result
+  ansible.builtin.assert:
+    that:
+      - "'1' in cnpg_smoke.stdout_lines"
+    fail_msg: >-
+      Smoke test against {{ cnpg_cluster_name }}-rw did not return one row.
+      Output: {{ cnpg_smoke.stdout_lines }}
+- name: Read the PostgreSQL Cluster status
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - get
+      - cluster,pods
+      - -o
+      - wide
+      - "--namespace={{ cnpg_cluster_namespace }}"
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: cnpg_status
+  changed_when: false
+
+- name: Show the PostgreSQL Cluster status
+  ansible.builtin.debug:
+    msg: "{{ cnpg_status.stdout_lines }}"

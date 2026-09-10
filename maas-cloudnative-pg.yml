@@ -1,0 +1,6 @@
+---
+- name: Install CloudNativePG and the PostgreSQL workload
+  hosts: kube_control_plane[0]
+  become: true
+  roles:
+    - maas-cloudnative-pg
