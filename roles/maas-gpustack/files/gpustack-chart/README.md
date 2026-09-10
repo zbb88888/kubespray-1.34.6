@@ -16,8 +16,9 @@ Deploying GPUStack in a Kubernetes cluster with Higress is still considered expe
 
 Please note the following limitations when deploying GPUStack on Kubernetes:
 
-- GPUStack Server is deployed as a StatefulSet and currently does not support more than one replica.
-- By default, the built-in `Postgres` database is used at startup. It is recommended to specify an external database using the `server.externalDatabaseURL` parameter.
+- GPUStack Server is deployed as a single-replica StatefulSet in this deployment design. A short Server outage and restart are acceptable for stable inference workloads; do not increase replicas without a distributed GPUStack Coordinator.
+- Production HA uses an externally managed PostgreSQL primary/standby database. The PostgreSQL operator or Helm deployment owns replication and failover; configure its stable read-write endpoint through `server.externalDatabaseURL`.
+- The built-in `Postgres` database is single-instance and is not a production HA database.
 - By default, the StatefulSet uses `volumeClaimTemplates` (10Gi PVC), which requires a default `StorageClass` to be configured in your cluster (in k3s, the default is `local-path`). Alternatively, set `server.dataVolume.hostPath` to use a host path volume instead of a PVC.
 - Higress plugins are served by a dedicated `gpustack/higress-plugins` Deployment installed alongside GPUStack. When the Higress gateway restarts, it will attempt to download the plugins from this service. If the service is unavailable, the gateway's startup will be blocked until the plugins are accessible.
 - The bundled `higress-core` sub-chart deploys Higress as the cluster's ingress controller. If another ingress controller is already running in the cluster, set `higress-core.enabled=false` and configure `gateway.ingressClassname` to use the existing Higress instance instead.

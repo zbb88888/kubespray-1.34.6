@@ -9,6 +9,17 @@ gpustack_release_name: gpustack
 gpustack_namespace: gpustack-system
 gpustack_server_node: "{{ groups['kube_node'][0] }}"
 gpustack_server_data_path: /var/lib/gpustack-server
+# External HA PostgreSQL/MySQL URL. Required when server replicas > 1.
+# Keep null to use the single-instance PostgreSQL bundled in the Server pod.
+gpustack_external_database_url: null
+# Deployments created by the GPUStack operator, outside this Helm release.
+# They use leader election: two replicas provide active/standby failover.
+gpustack_control_plane_deployments:
+  - csi-nfs-controller
+  - csi-s3-controller
+  - kueue-controller-manager
+  - node-feature-discovery-gc
+  - node-feature-discovery-master
 gpustack_helm_wait: true
 # First install pulls the GPUStack, Higress and operator images, then waits for
 # the post-install hook Job. 10m proved too short on a cold node.
@@ -25,6 +36,9 @@ gpustack_kueue_delay: 10
 gpustack_pod_ready_timeout: 5m
 gpustack_pod_ready_retries: 6
 gpustack_pod_ready_delay: 10
+# The operator creates these controller Deployments asynchronously.
+gpustack_control_plane_patch_retries: 60
+gpustack_control_plane_patch_delay: 10
 # Bundled dependency archive that must exist under files/gpustack-chart/charts/.
 gpustack_chart_dependency_file: higress-core-2.1.9.tgz
 # Pin all GPUStack images to the v2.3.0rc1 release. The chart appVersion is

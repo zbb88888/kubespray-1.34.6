@@ -431,6 +431,50 @@
   delegate_to: "{{ groups['kube_control_plane'][0] }}"
   run_once: true
 
+# These controllers are installed by the GPUStack operator and are outside
+# the bundled Helm release. Patch only known controller Deployments after the
+# operator has created them; the operator's reconciliation remains the owner.
+- name: Wait for GPUStack dependency controller Deployments
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - -n
+      - "{{ gpustack_namespace }}"
+      - get
+      - deployment/{{ item }}
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  loop: "{{ gpustack_control_plane_deployments }}"
+  loop_control:
+    label: "{{ item }}"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  register: gpustack_dependency_deployments
+  changed_when: false
+  retries: "{{ gpustack_control_plane_patch_retries }}"
+  delay: "{{ gpustack_control_plane_patch_delay }}"
+  until: gpustack_dependency_deployments.rc == 0
+
+- name: Scale GPUStack dependency controller Deployments to two replicas
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - -n
+      - "{{ gpustack_namespace }}"
+      - scale
+      - deployment/{{ item }}
+      - --replicas=2
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  loop: "{{ gpustack_control_plane_deployments }}"
+  loop_control:
+    label: "{{ item }}"
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  run_once: true
+  register: gpustack_dependency_scale
+  failed_when: false
+  changed_when: "'scaled' in gpustack_dependency_scale.stdout"
+
 - name: Wait for the NVIDIA GPUStack worker DaemonSet
   ansible.builtin.command:
     argv:

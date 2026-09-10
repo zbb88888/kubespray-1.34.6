@@ -22,9 +22,102 @@ values 模板显式固定 GPUStack、Higress plugins 和 operator 镜像版本�
   installed; GPUStack manages its Kubernetes workers.
 - The source chart needs `operator.image.tag`; the values template pins it to
   `v0.8.6`, matching Release `v2.3.0rc1`.
-- LocalPV is not required. GPUStack server data uses a node-local `hostPath`.
+- LocalPV is not required for the current single-replica Server deployment. GPUStack
+  Server data uses a node-local `hostPath`.
+- PostgreSQL is a required HA dependency for the planned GPUStack external-server
+  deployment. It will be deployed and operated outside the GPUStack Helm release,
+  using a PostgreSQL operator or a Helm-managed primary/standby solution. GPUStack
+  connects through the database read-write Service and does not manage database
+  replication or failover.
+- Redis and a standalone message queue are not required by the current GPUStack
+  deployment. Add them only when a selected GPUStack extension or platform feature
+  explicitly requires them.
+- GPUStack Server remains one replica in this role. A short Server outage and
+  restart are acceptable for the stable-inference use case. Existing inference
+  workloads are expected to continue where the Worker process remains healthy;
+  Server API and control operations are temporarily unavailable.
 - The NVIDIA Container Toolkit repository is external; without an exact package
   pin, future repository updates may change the installed version.
+
+## 高可用部署设计
+
+后续高可用改造固定遵循下面的边界，新增组件或修改副本数时必须按此设计检查。
+
+### 1. 外部 PostgreSQL HA
+
+GPUStack 的业务数据库采用外部 PostgreSQL，不使用 Server Pod 内置的单实例
+PostgreSQL 作为生产 HA 数据库。PostgreSQL 由独立的 operator 或 Helm 方案维护，
+至少提供一个 Primary 和一个 Standby，并负责复制、故障检测和自动切换。生产环境
+优先使用具备稳定读写 Service 的方案，GPUStack 只配置该读写地址：
+
+```yaml
+server:
+  externalDatabaseURL: postgresql://<user>:<password>@<postgres-rw>:5432/gpustack
+```
+
+PostgreSQL HA 是 GPUStack Server 多副本或 Server 故障恢复的前置条件。数据库方案
+还必须覆盖备份、恢复、凭据管理和数据库迁移的并发控制。MySQL 与 PostgreSQL
+二选一即可，当前部署方案选择 PostgreSQL，不同时部署两种数据库。
+
+### 2. GPUStack Helm 内的 Kubernetes 控制面
+
+GPUStack Helm release 内直接管理的控制面组件，支持主备的统一部署为至少两个
+副本，并通过组件自身的 Leader Election 保证只有一个实例执行控制操作。无状态
+流量组件使用至少两个副本并按主主方式接收流量。
+
+当前目标副本和模式如下：
+
+| 组件 | 副本 | 模式 |
+| --- | ---: | --- |
+| `gpustack-operator` | 2 | 主备 |
+| `higress-controller` | 2 | 主备 |
+| `higress-gateway` | 2 | 主主 |
+| `gpustack-higress-plugins` | 2 | 主主 |
+
+Worker、Device Manager 和 CSI Node Plugin 继续使用 DaemonSet，每个适配节点一个，
+不按普通 Deployment 的主备副本处理。
+
+### 3. Helm 外由 GPUStack 依赖的 Kubernetes 控制面
+
+GPUStack Operator 在 Helm release 外创建的控制面 Deployment，部署完成后由
+role 统一 patch 为两个副本：
+
+```text
+csi-nfs-controller
+csi-s3-controller
+kueue-controller-manager
+node-feature-discovery-gc
+node-feature-discovery-master
+```
+
+这些组件按主备模式运行。role 必须等待 Deployment 创建完成后再 patch，并在检查
+阶段确认副本数和 Ready 状态。Operator 后续若会覆盖副本数，需要把副本配置修改到
+其真正的源配置，不能只依赖一次性的手工 scale。对应的 Node Plugin、NFD Worker、
+GPUStack Worker 和 Device Manager 仍按节点 DaemonSet 部署。
+
+所有两个副本的控制面组件后续都应检查节点反亲和或拓扑分布，避免两个副本落在同一
+节点。适用时增加 PodDisruptionBudget，避免维护操作同时驱逐主备实例。
+
+### 4. GPUStack Server 可用性边界
+
+当前稳定推理业务允许 GPUStack Server 短时不可用并重启，因此本方案不以 Server
+两副本作为第一阶段目标。Server 重启期间：
+
+- 已经运行且 Worker 健康的推理业务允许继续提供服务；
+- Server API、模型管理、调度和控制操作会短时不可用；
+- Server 恢复后从外部 PostgreSQL 读取持久化状态并继续控制业务；
+- Server 不应依赖与 Pod 绑定的内置 PostgreSQL 作为生产数据源。
+
+如果未来要求 Server API 本身无中断，再单独评估 Server 多副本。届时除外部
+PostgreSQL 外，还必须提供 GPUStack 分布式 Coordinator，用于 Leader Election 和
+跨 Server 事件同步。当前 `LocalCoordinator` 只在单进程内工作，不能支撑两个 Server
+的安全主备，因此不能仅把 StatefulSet 的 `replicas` 改为 2。
+
+### 5. 不引入的中间件
+
+当前方案不部署 Redis、RabbitMQ、Kafka 或其他独立消息队列。GPUStack 当前业务路径
+不要求 Redis 或独立 MQ；只有选定的扩展或未来 Coordinator 实现明确依赖时，才新增
+对应中间件及其 HA 方案。
 
 ## 执行阶段
 

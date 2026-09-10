@@ -22,6 +22,7 @@ data:
     ---
     certmanagerEnabled: false
     namespaceName: "{{ .Release.Namespace }}"
+    replicas: {{ .Values.operator.replicas | default 1 }}
 
   template.yaml: |
 
@@ -93,7 +94,7 @@ data:
         app.kubernetes.io/component: operator
         app.kubernetes.io/name: {{ .Release.Name }}-operator
     spec:
-      replicas: 1
+      replicas: #@ data.values.replicas
       selector:
         matchLabels:
           app.kubernetes.io/part-of: gpustack-operator

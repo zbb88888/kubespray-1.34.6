@@ -11,6 +11,9 @@ image:
 
 server:
   replicas: 1
+{% if gpustack_external_database_url is not none %}
+  externalDatabaseURL: {{ gpustack_external_database_url | to_json }}
+{% endif %}
   ingress:
 {% if gpustack_server_ingress_hostname is not none %}
     hostname: "{{ gpustack_server_ingress_hostname }}"
@@ -37,6 +40,8 @@ operator:
 
 higress-core:
   enabled: true
+  controller:
+    replicas: 2
   gateway:
     # This cluster has no cloud provider and no MetalLB, so the subchart's
     # default LoadBalancer Service would sit at EXTERNAL-IP <pending> forever.
@@ -60,6 +65,7 @@ higress-core:
       externalTrafficPolicy: Local
 
 higressPlugins:
+  replicas: 2
   image:
     tag: "{{ gpustack_higress_plugins_image_tag }}"
 

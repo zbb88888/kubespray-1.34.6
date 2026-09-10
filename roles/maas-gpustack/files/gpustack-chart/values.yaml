@@ -210,7 +210,7 @@ higress-core:
     image: gpustack/mirrored-higress-pilot
 higressPlugins:
   # Number of higress-plugins deployment replicas.
-  replicas: 1
+  replicas: 2
   image:
     # Image repository including namespace (no registry); final reference is `{global.hub}/{repository}:{tag}`.
     repository: gpustack/higress-plugins
@@ -275,6 +275,9 @@ worker:
   #     path: /opt/custom/lib
   #     type: DirectoryOrCreate
 operator:
+  # Number of operator Deployment replicas. Only one replica is active at a
+  # time; the others wait for the operator's leader election.
+  replicas: 2
   # Operator manages worker DaemonSet lifecycle. Automatically enabled with
   # worker.enabled=true — setting this manually is not needed in most cases.
   image:
