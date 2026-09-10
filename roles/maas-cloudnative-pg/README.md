@@ -35,8 +35,8 @@ playbook 只有一个 play，目标是 `kube_control_plane[0]`，执行顺序：
    建表 → 插入 → 计数 → 删表，结果不为 1 即失败
 7. 打印 Cluster 和 Pod 状态
 
-全流程幂等，重复执行 `changed=0`。首次安装约 4 分钟，其中 3 分钟是三个实例依次
-bootstrap。
+全流程幂等，重复执行 `changed=0`。从零安装实测 1 分 38 秒（镜像已缓存），
+其中 77 秒是三个实例依次 bootstrap；首次拉镜像约 4 分钟。
 
 ## 常用变量
 
@@ -154,4 +154,7 @@ kubectl delete -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-p
 - 冒烟测试通过且无残留表；重复执行 `ok=16 changed=0`
 - 节点数校验反向验证：`-e cnpg_instances=5` 在 5 秒内失败并指出真实原因，
   而不是等 Pod Pending 到超时
+- **从零重建**：按上面「卸载」的顺序删干净（namespace、CRD、PV 均无残留），
+  再跑一遍 playbook，1 分 38 秒完成，恢复到 3/3 healthy 与两个 quorum 备库。
+  卸载顺序和安装流程同时得到验证
 - `yamllint` 与 `ansible-lint`（`production` profile）零告警
