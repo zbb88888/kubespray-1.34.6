@@ -23,13 +23,17 @@ ansible-playbook -i inventory/maas-ha01/inventory.ini maas-cloudnative-pg.yml -b
 playbook 只有一个 play，目标是 `kube_control_plane[0]`，执行顺序：
 
 1. 校验 StorageClass 存在（缺失时直接失败并给出开启方法）
-2. `kubectl apply --server-side` 安装 operator，等待 Deployment Available
-3. 渲染 Cluster manifest 到 `/tmp/cnpg-cluster.yaml`，创建 namespace 并 apply
-4. 等待 `Ready` 条件，再等待 `.status.phase == "Cluster in healthy state"`
+2. `kubectl apply --server-side --force-conflicts` 安装 operator，等待 Deployment
+   Available。`--force-conflicts` 是 CNPG 文档给出的升级路径，可接管此前由
+   client-side apply 或 Helm 留下的字段所有权
+3. 校验带 nodeSelector 标签的节点数 ≥ `cnpg_instances`。反亲和是 required，
+   节点不够只会让 Pod 一直 Pending，这里几秒内失败而不是等到超时
+4. 渲染 Cluster manifest 到 `/tmp/cnpg-cluster.yaml`，创建 namespace 并 apply
+5. 等待 `Ready` 条件，再等待 `.status.phase == "Cluster in healthy state"`
    （配置变更触发滚动重启时，`Ready` 仍为 True，必须靠 phase 才能等到收敛）
-5. 取当前主库，通过 `<cluster>-rw` Service 和 `app` 用户做写入/读取冒烟测试，
+6. 取当前主库，通过 `<cluster>-rw` Service 和 `app` 用户做写入/读取冒烟测试，
    建表 → 插入 → 计数 → 删表，结果不为 1 即失败
-6. 打印 Cluster 和 Pod 状态
+7. 打印 Cluster 和 Pod 状态
 
 全流程幂等，重复执行 `changed=0`。首次安装约 4 分钟，其中 3 分钟是三个实例依次
 bootstrap。
@@ -40,7 +44,7 @@ bootstrap。
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `cnpg_manifest_url` | v1.30.0 release manifest | 升级 operator 时同时改 URL 中的分支和版本 |
+| `cnpg_manifest_url` | v1.30.0 release manifest | 升级 operator 时同时改 URL 中的分支和版本。也可填控制节点上的本地文件路径，用于离线环境 |
 | `cnpg_cluster_name` / `cnpg_cluster_namespace` | `pg-main` / `pg` | |
 | `cnpg_instances` | 3 | 一主两备；改为 1 时自动去掉同步复制和反亲和 |
 | `cnpg_postgres_image` | `postgresql:17.6-standard-bookworm` | |
@@ -80,6 +84,20 @@ kubectl -n pg delete pod "$(kubectl -n pg get cluster pg-main -o jsonpath='{.sta
 kubectl -n pg delete pvc pg-main-N pg-main-N-wal
 kubectl -n pg delete pod pg-main-N
 ```
+
+## 卸载
+
+没有 reset playbook，删除是三条命令，顺序不能反（先删 Cluster，让 operator
+有机会清理 finalizer）：
+
+```bash
+kubectl -n pg delete cluster pg-main
+kubectl delete namespace pg          # 一并回收 PVC 和 Secret，数据不可恢复
+kubectl delete -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.30/releases/cnpg-1.30.0.yaml
+```
+
+删除 operator 不会影响已有的 PostgreSQL Pod 继续运行，但此后没有故障切换和
+自愈能力。
 
 ## 工作负载设计
 
@@ -133,5 +151,7 @@ kubectl -n pg delete pod pg-main-N
 - 三个实例分别落在三个控制节点，两个备库 `streaming` + `quorum`，无 replay_lag
 - 故障切换实测：删除主 Pod → 10 秒升主、20 秒恢复 3/3、数据无损
 - `pg-main-superuser` Secret 不存在，超级用户确实关闭
-- 冒烟测试通过且无残留表；重复执行 `changed=0`
+- 冒烟测试通过且无残留表；重复执行 `ok=16 changed=0`
+- 节点数校验反向验证：`-e cnpg_instances=5` 在 5 秒内失败并指出真实原因，
+  而不是等 Pod Pending 到超时
 - `yamllint` 与 `ansible-lint`（`production` profile）零告警

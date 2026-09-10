@@ -23,12 +23,15 @@
 
 # Server-side apply: the CRDs carry schemas far larger than the 262kB
 # last-applied-configuration annotation a client-side apply would write.
+# --force-conflicts is the documented CNPG upgrade path: it takes ownership of
+# fields left behind by a previous client-side apply or a Helm install.
 - name: Install the CloudNativePG operator
   ansible.builtin.command:
     argv:
       - "{{ bin_dir }}/kubectl"
       - apply
       - --server-side
+      - --force-conflicts
       - -f
       - "{{ cnpg_manifest_url }}"
   environment:
@@ -50,6 +53,32 @@
   environment:
     KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
   changed_when: false
+
+# Pod anti-affinity is required, so fewer matching nodes than instances leaves
+# Pods Pending until the wait times out. Fail in seconds with the real reason.
+- name: Count the nodes matching the PostgreSQL node selector
+  ansible.builtin.command:
+    argv:
+      - "{{ bin_dir }}/kubectl"
+      - get
+      - nodes
+      - "--selector={{ cnpg_node_selector | dict2items | map(attribute='key') | join(',') }}"
+      - -o
+      - jsonpath={.items[*].metadata.name}
+  environment:
+    KUBECONFIG: "{{ kube_config_dir }}/admin.conf"
+  register: cnpg_selected_nodes
+  changed_when: false
+
+- name: Fail when too few nodes match the PostgreSQL node selector
+  ansible.builtin.assert:
+    that:
+      - cnpg_selected_nodes.stdout.split() | length >= cnpg_instances | int
+    fail_msg: >-
+      {{ cnpg_instances }} instances need at least as many nodes matching
+      {{ cnpg_node_selector }}, found
+      {{ cnpg_selected_nodes.stdout.split() | length }}. Required pod
+      anti-affinity would leave the surplus instances Pending.
 
 - name: Render the PostgreSQL Cluster manifest
   ansible.builtin.template:
