@@ -153,6 +153,13 @@ When `worker.gpuVendors` lists one or more vendors, the chart renders a per-vend
 
 > **Prerequisite:** The PCI-presence labels are advertised by [Node Feature Discovery (NFD)](https://kubernetes-sigs.github.io/node-feature-discovery/). NFD must be installed in the cluster for worker pods to schedule onto GPU nodes. Without NFD, no nodes will carry the required labels and all worker pods will remain Pending.
 
+> **Local note (maas-gpustack):** NFD does not have to be pre-installed. In this
+> cluster Kubespray leaves it disabled (`node_feature_discovery_enabled: false`)
+> and the GPUStack operator installs it into `gpustack-system` as part of its own
+> release. The role additionally labels GPU nodes itself, because NFD is not
+> guaranteed to advertise the PCI-presence label. Re-add this note if the
+> bundled chart is refreshed from upstream.
+
 Example values:
 
 ```yaml

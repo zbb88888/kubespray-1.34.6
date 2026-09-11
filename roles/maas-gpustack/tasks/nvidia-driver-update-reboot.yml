@@ -1,4 +1,12 @@
 ---
+# 重启步骤：source_verify、rollout 与 reboot 阶段共用。
+# 任一条件成立即需要重启：
+#   1) /var/run/reboot-required 存在（内核或其它包要求重启）
+#   2) 本次运行改动了 NVIDIA 包状态
+#   3) 运行内核的 nvidia 模块文件比本次启动更新 —— 模块提供者已切换
+#      （例如 DKMS → 预编译），必须重启才能加载新模块
+#   4) 已安装驱动版本与已加载版本不一致
+
 - name: Check whether this node requires a reboot
   ansible.builtin.stat:
     path: /var/run/reboot-required
@@ -24,14 +32,34 @@
   changed_when: false
   failed_when: false
 
+# 模块文件的 mtime 晚于本次启动时间，说明磁盘上的模块不是当前已加载的那个：
+# 这是"提供者已切换、需要重启"的可观测判据（DKMS 与预编译模块的 version 与
+# srcversion 完全相同，无法用版本号区分）。
+- name: Compare the kernel module on disk with this boot
+  ansible.builtin.shell: |
+    set -o pipefail
+    module_path="$(modinfo -F filename nvidia 2>/dev/null || true)"
+    module_mtime=0
+    if [ -n "$module_path" ] && [ -e "$module_path" ]; then
+      module_mtime="$(stat -c %Y "$module_path")"
+    fi
+    boot_time="$(date -d "$(uptime -s)" +%s 2>/dev/null || echo 0)"
+    if [ "$module_mtime" -gt "$boot_time" ]; then
+      echo newer
+    else
+      echo current
+    fi
+  args:
+    executable: /bin/bash
+  register: nvidia_module_freshness
+  changed_when: false
+  failed_when: false
+
 - name: Normalize installed and loaded NVIDIA driver versions
   ansible.builtin.set_fact:
     nvidia_installed_driver_version: "{{ nvidia_installed_driver.stdout | trim | regex_search('^[0-9]+\\.[0-9]+') | default('', true) }}"
     nvidia_loaded_driver_version: "{{ nvidia_loaded_driver.stdout | trim | regex_search('^[0-9]+\\.[0-9]+') | default('', true) }}"
 
-# A version mismatch only justifies a reboot when this run changed the NVIDIA
-# packages or the system itself asked for one. Otherwise the node has already
-# been rebooted and a stale mismatch will never be fixed by rebooting again.
 - name: Determine why this node requires a reboot
   ansible.builtin.set_fact:
     nvidia_reboot_reasons: >-
@@ -41,6 +69,9 @@
       {%- endif -%}
       {%- if nvidia_reboot_required_by_role | default(false) -%}
       {%-   set _ = reasons.append('NVIDIA package state changed during this run') -%}
+      {%- endif -%}
+      {%- if nvidia_module_freshness.stdout | trim == 'newer' -%}
+      {%-   set _ = reasons.append('the nvidia module on disk is newer than this boot (module provider changed)') -%}
       {%- endif -%}
       {%- set installed_but_not_loaded = nvidia_installed_driver_version != '' and nvidia_loaded_driver_version == '' -%}
       {%- set versions_differ = nvidia_installed_driver_version != '' and nvidia_loaded_driver_version != '' and nvidia_installed_driver_version != nvidia_loaded_driver_version -%}
@@ -57,49 +88,62 @@
   ansible.builtin.set_fact:
     nvidia_reboot_needed: "{{ nvidia_reboot_reasons | length > 0 }}"
 
+# 版本不一致但既没有 reboot-required、也没有换过包、模块文件也不比启动新，
+# 说明问题不是"没重启"，再重启一次也不会修好，直接停下避免瞎重启。
 - name: Stop when another reboot cannot resolve the driver mismatch
   ansible.builtin.fail:
     msg: >-
-      {{ inventory_hostname }} has installed NVIDIA driver
-      {{ nvidia_installed_driver_version }} but
-      {%- if nvidia_loaded_driver_version == '' %} no loaded driver was detected
-      {%- else %} the loaded driver is {{ nvidia_loaded_driver_version }}
-      {%- endif %}. /var/run/reboot-required is absent and no NVIDIA package was
-      changed during this run, so rebooting again is not the fix. Inspect the DKMS
-      state with `dkms status`, the module version with
-      `modinfo -F version nvidia`, and kernel module errors with
-      `journalctl -k | grep -i nvidia`. If the module file exists but is not
-      loaded, try `modprobe nvidia && nvidia-smi`; Secure Boot/MOK enrollment
-      is a common cause when the module cannot be loaded.
+      {{ inventory_hostname }} 已安装 NVIDIA 驱动
+      {{ nvidia_installed_driver_version }}，但
+      {%- if nvidia_loaded_driver_version == '' %} 未检测到已加载驱动
+      {%- else %} 已加载驱动是 {{ nvidia_loaded_driver_version }}
+      {%- endif %}。/var/run/reboot-required 不存在、本次运行也没有改动 NVIDIA
+      包，重启不是解决办法。请检查 `modinfo -F filename nvidia`（应指向
+      /lib/modules/<abi>/kernel/nvidia-595-open/nvidia.ko，而不是 updates/dkms）、
+      `dkms status` 与 `journalctl -k | grep -i nvidia`。
   when:
     - nvidia_installed_driver_version != ''
     - nvidia_loaded_driver_version != nvidia_installed_driver_version
     - not nvidia_reboot_required.stat.exists
     - not (nvidia_reboot_required_by_role | default(false))
+    - nvidia_module_freshness.stdout | trim != 'newer'
 
 - name: Ask before rebooting this node
   ansible.builtin.pause:
     prompt: >-
-      {{ inventory_hostname }} requires a reboot.
-      Reasons: {{ nvidia_reboot_reasons | join('; ') }}.
-      Type 'yes' to reboot it
+      {{ inventory_hostname }} 需要重启。原因：{{ nvidia_reboot_reasons | join('; ') }}。
+      输入 yes 重启，其它输入则停止执行。
   register: nvidia_reboot_confirmation
   delegate_to: localhost
-  when: nvidia_reboot_needed
-
-- name: Reboot this node after confirmation
-  ansible.builtin.reboot:
-    reboot_timeout: 900
   when:
     - nvidia_reboot_needed
-    - nvidia_reboot_confirmation.user_input | default('') | lower == 'yes'
+    - nvidia_reboot_confirm | bool
+
+- name: Decide whether this node is allowed to reboot
+  ansible.builtin.set_fact:
+    nvidia_reboot_approved: >-
+      {{ ((nvidia_reboot_confirmation.user_input | default('')) | lower == 'yes')
+         if (nvidia_reboot_confirm | bool) else true }}
+  when: nvidia_reboot_needed
+
+- name: Reboot this node
+  ansible.builtin.reboot:
+    reboot_timeout: "{{ nvidia_reboot_timeout }}"
+  register: nvidia_reboot_result
+  when:
+    - nvidia_reboot_needed
+    - nvidia_reboot_approved | bool
+
+- name: Record that this node was rebooted
+  ansible.builtin.set_fact:
+    nvidia_rebooted: true
+  when: nvidia_reboot_result.changed | default(false)
 
 - name: Stop if reboot was declined
   ansible.builtin.fail:
     msg: >-
-      Reboot required for {{ inventory_hostname }}:
-      {{ nvidia_reboot_reasons | join('; ') }}.
-      Reboot declined. Re-run the role after a real reboot.
+      {{ inventory_hostname }} 需要重启：{{ nvidia_reboot_reasons | join('; ') }}。
+      已拒绝重启，停止执行；请手动重启该节点后重新运行。
   when:
     - nvidia_reboot_needed
-    - nvidia_reboot_confirmation.user_input | default('') | lower != 'yes'
+    - not (nvidia_reboot_approved | bool)

@@ -1,0 +1,19 @@
+---
+# 重启（如需要）并验收单台节点。source_verify 与 rollout 阶段共用。
+
+- name: Detect whether this node has an NVIDIA GPU
+  ansible.builtin.include_tasks: nvidia-detect-gpu.yml
+
+- name: Reboot the node when the driver provider changed
+  ansible.builtin.include_tasks: nvidia-driver-update-reboot.yml
+
+# 重启可能切换内核 ABI（例如此前 pending 的内核升级），必须重新采集事实，
+# 否则 nvidia_driver_module_payload 仍指向旧内核，验收会看错包。
+- name: Refresh facts after the reboot
+  ansible.builtin.setup:
+    gather_subset:
+      - min
+  when: nvidia_rebooted | default(false)
+
+- name: Verify the precompiled driver state
+  ansible.builtin.include_tasks: nvidia-preinstall-check.yml

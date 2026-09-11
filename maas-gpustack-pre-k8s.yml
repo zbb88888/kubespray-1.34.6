@@ -1,32 +1,56 @@
 ---
-- name: Install the NVIDIA driver on the source node
+# NVIDIA 预编译驱动部署编排，路线与验收标准见 roles/maas-gpustack/GPU-Driver.md。
+#
+#   第一步 source        只给第一台节点（kube_node[0]）安装，不重启
+#   第二步 source_verify 重启并验收第一台节点；可反复执行，已完备时不会重启
+#   第三步 rollout       其余节点逐台 安装 → 重启 → 验收，一次一台，失败即停
+#   第四步 verify        全集群只读终验
+#
+# 第一台节点必须先由第二步验收通过，第三步才会继续；rollout 每处理一台之前
+# 还会再复核一次第一台节点（金丝雀）。
+#
+# 分步执行（不写 --tags 时四步全跑）：
+#   --tags nvidia-source,nvidia-source-verify   只做第一台节点
+#   --tags nvidia-rollout                       只滚动其余节点
+#   --tags nvidia-verify                        只做全集群终验
+
+- name: 第一步 在第一台节点安装预编译 NVIDIA 驱动
   hosts: kube_node[0]
   become: true
+  tags:
+    - nvidia-source
   vars:
     maas_gpustack_phase: source
   roles:
     - maas-gpustack
 
-- name: Align NVIDIA packages across the cluster
-  hosts: kube_node
+- name: 第二步 重启并验收第一台节点（可重复执行）
+  hosts: kube_node[0]
   become: true
+  tags:
+    - nvidia-source-verify
   vars:
-    maas_gpustack_phase: sync
+    maas_gpustack_phase: source_verify
   roles:
     - maas-gpustack
 
-- name: Reboot nodes after NVIDIA driver changes
+- name: 第三步 其余节点逐台安装并重启
   hosts: kube_node
   serial: 1
+  any_errors_fatal: true
   become: true
+  tags:
+    - nvidia-rollout
   vars:
-    maas_gpustack_phase: reboot
+    maas_gpustack_phase: rollout
   roles:
     - maas-gpustack
 
-- name: Verify pure-DKMS state after reboot
+- name: 第四步 全集群验收
   hosts: kube_node
   become: true
+  tags:
+    - nvidia-verify
   vars:
     maas_gpustack_phase: verify
   roles:

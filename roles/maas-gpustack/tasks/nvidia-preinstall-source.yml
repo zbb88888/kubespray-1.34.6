@@ -1,0 +1,20 @@
+---
+# 第一阶段：只处理第一台节点（kube_node[0]）。
+# 本阶段只安装，不重启；重启与验收由 source_verify 阶段完成，便于人工确认。
+
+- name: Assert this play targets the driver source node
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname == nvidia_driver_source
+    fail_msg: >-
+      source 阶段只处理第一台节点 {{ nvidia_driver_source }}，当前主机是
+      {{ inventory_hostname }}；请检查 playbook 的 hosts。
+
+- name: Install the precompiled driver packages
+  ansible.builtin.include_tasks: nvidia-preinstall-install.yml
+
+- name: Tell the operator what to run next
+  ansible.builtin.debug:
+    msg:
+      - "{{ inventory_hostname }}：预编译驱动包已安装，DKMS 构建包已移除。"
+      - "下一步：重新执行 playbook 的 source_verify 阶段，重启本节点并验收。"

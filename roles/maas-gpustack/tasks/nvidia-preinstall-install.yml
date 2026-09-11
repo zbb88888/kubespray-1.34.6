@@ -1,0 +1,185 @@
+---
+# 预编译路线（GPU-Driver.md 第 6 节）的共享安装步骤。
+# 调用方：nvidia-preinstall-source.yml（第一台节点）、nvidia-preinstall-rollout.yml（其余节点）。
+
+- name: Detect whether this node has an NVIDIA GPU
+  ansible.builtin.include_tasks: nvidia-detect-gpu.yml
+
+- name: Read the precompiled tracker package policy
+  ansible.builtin.command:
+    cmd: "apt-cache policy {{ nvidia_driver_module_tracker }}"
+  register: nvidia_tracker_policy
+  changed_when: false
+  failed_when: false
+  when: gpustack_node_has_gpu
+
+# Canonical 只为受支持的内核矩阵构建预编译模块。没有候选版本说明运行内核不在
+# 矩阵内，此时继续执行只会把节点留在没有模块可用的状态，所以直接停下。
+- name: Assert Canonical published precompiled modules for this kernel ABI
+  ansible.builtin.assert:
+    that:
+      - nvidia_tracker_policy.rc == 0
+      - nvidia_tracker_policy.stdout is search('Candidate:')
+      - nvidia_tracker_policy.stdout is not search('Candidate: \(none\)')
+    fail_msg: >-
+      {{ inventory_hostname }} 运行内核 {{ ansible_kernel }}，但 Ubuntu archive 中
+      没有 {{ nvidia_driver_module_tracker }} 的可用候选版本
+      （apt-cache rc={{ nvidia_tracker_policy.rc | default('n/a') }}，
+      stderr={{ nvidia_tracker_policy.stderr | default('') | trim }}）。
+      该内核不在 Canonical 预编译矩阵内；请改回 LTS generic/HWE 内核，
+      或按 GPU-Driver.md 重新评估路线。
+  when: gpustack_node_has_gpu
+
+# 追踪包存在不代表"运行中的这个 ABI"也有载荷包：archive 只保留最近的几个 ABI。
+# 节点若还跑着更旧的内核，这里必须先停下，否则切换后运行内核会没有模块。
+- name: Read the running-ABI payload package policy
+  ansible.builtin.command:
+    cmd: "apt-cache policy {{ nvidia_driver_module_payload }}"
+  register: nvidia_payload_policy
+  changed_when: false
+  failed_when: false
+  when: gpustack_node_has_gpu
+
+- name: Assert the running kernel ABI also has a published payload
+  ansible.builtin.assert:
+    that:
+      - nvidia_payload_policy.rc == 0
+      - nvidia_payload_policy.stdout is search('Candidate:')
+      - nvidia_payload_policy.stdout is not search('Candidate: \(none\)')
+    fail_msg: >-
+      {{ inventory_hostname }} 运行内核 {{ ansible_kernel }} 对应的载荷包
+      {{ nvidia_driver_module_payload }} 在 Ubuntu archive 中没有可用候选版本
+      （apt-cache rc={{ nvidia_payload_policy.rc | default('n/a') }}，
+      stderr={{ nvidia_payload_policy.stderr | default('') | trim }}）。
+      说明运行内核早于 Canonical 当前构建的 ABI；请先升级内核并重启到受支持的
+      ABI，再执行本阶段。
+  when: gpustack_node_has_gpu
+
+# 这条 pin 是"纯预编译"的兜底：用户态元包的 nvidia-dkms-* 依赖由追踪包的
+# Provides 满足，因此任何真正需要安装 nvidia-dkms-* 的事务都是意外回退，
+# 应当失败而不是静默回到 DKMS。
+- name: Block DKMS build packages with a negative APT pin
+  ansible.builtin.copy:
+    dest: "{{ nvidia_driver_apt_pin_file }}"
+    mode: "0644"
+    content: |
+      # Maintained by roles/maas-gpustack. See GPU-Driver.md.
+      # Precompiled route (Ubuntu restricted): never fall back to DKMS builds.
+      Package: nvidia-dkms-*
+      Pin: release *
+      Pin-Priority: -1
+  when:
+    - gpustack_node_has_gpu
+    - nvidia_driver_block_dkms | bool
+
+- name: Remove the stale pin file written by an earlier revision
+  ansible.builtin.file:
+    path: /etc/apt/preferences.d/nvidia-precompiled-only.prefs
+    state: absent
+  when: gpustack_node_has_gpu
+
+- name: Remove the DKMS block pin when the guard is disabled
+  ansible.builtin.file:
+    path: "{{ nvidia_driver_apt_pin_file }}"
+    state: absent
+  when:
+    - gpustack_node_has_gpu
+    - not (nvidia_driver_block_dkms | bool)
+
+- name: Verify the DKMS build package can no longer be installed
+  ansible.builtin.command:
+    cmd: "apt-cache policy {{ nvidia_driver_dkms_packages[0] }}"
+  register: nvidia_dkms_policy
+  changed_when: false
+  failed_when: false
+  when:
+    - gpustack_node_has_gpu
+    - nvidia_driver_block_dkms | bool
+
+- name: Assert the DKMS build package is blocked by the pin
+  ansible.builtin.assert:
+    that:
+      - "'Candidate: (none)' in nvidia_dkms_policy.stdout"
+    fail_msg: >-
+      apt 负向 pin 未生效：{{ nvidia_driver_dkms_packages[0] }} 仍有候选版本，
+      apt-cache 输出为 {{ nvidia_dkms_policy.stdout | default('') | trim }}。
+      请检查 {{ nvidia_driver_apt_pin_file }} 是否存在且语法正确。
+  when:
+    - gpustack_node_has_gpu
+    - nvidia_driver_block_dkms | bool
+
+- name: Refresh the APT cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  when: gpustack_node_has_gpu
+
+# 单事务提交：一次 apt 调用里装齐目标包、移除其余驱动包。
+#
+# 为什么必须是同一个事务：nvidia-driver-595-open 依赖虚拟名 nvidia-dkms-595-open，
+# 而该虚拟名由追踪包的 Provides 提供。若拆成"先 purge DKMS 再 install"两个事务，
+# 中间态无人满足该依赖，apt 会连带移除用户态元包（实测：单独 purge 会移除
+# nvidia-dkms-595-open 与 nvidia-driver-595-open 两个包）。在同一事务里，apt 按依赖图
+# 排序，先装好替代提供者、再删被替代者（实测顺序 Inst tracker → Remv nvidia-dkms
+# → Inst payload），既无共存窗口也无依赖悬空。
+#
+# 移除集合 = dpkg 驱动包全集 − 容器工具链 − 目标系列，逐条规则：
+#   1) nvidia-dkms-*                        —— DKMS 构建包，一律移除
+#   2) linux-modules-nvidia-* 非目标系列     —— 其它系列/flavor 的预编译模块
+#   3) 带其它三位系列号的包（如 -580/-535）  —— 换驱动系列后的残留
+# 目标系列的其余包（libnvidia-*-595、nvidia-utils-595 等）全部保留：
+# 它们是用户态元包的依赖，由 apt 自己维护，不手写清单。
+- name: Apply the NVIDIA driver package transaction
+  ansible.builtin.shell: |
+    set -o pipefail
+    series="{{ nvidia_driver_series }}"
+    desired="{{ nvidia_driver_module_tracker }} {{ nvidia_driver_module_payload }} {{ nvidia_driver_userspace_metapackage }}"
+    unwanted="$(
+      dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 2>/dev/null |
+        awk '$1 == "ii" {print $2}' |
+        sed 's/:amd64$//' |
+        grep -E '^(nvidia|libnvidia)' |
+        grep -vE '^(nvidia|libnvidia)-container' |
+        awk -v s="$series" '
+          /^nvidia-dkms-/ { print; next }
+          /^linux-modules-nvidia-/ {
+            if ($0 !~ ("^linux-modules-nvidia-" s "-")) print
+            next
+          }
+          /-[0-9][0-9][0-9]([.-]|$)/ {
+            if ($0 !~ ("-" s "([.-]|$)")) print
+          }
+        '
+    )"
+    removals=""
+    for package in $unwanted; do
+      removals="$removals $package-"
+    done
+    echo "desired:  $desired"
+    echo "removals:${removals:- (none)}"
+    # 尾缀 '-' 是 apt 的移除语法；removals 为空时展开为空，不影响安装。
+    apt-get install -y --no-install-recommends \
+      -o Dpkg::Options::=--force-confold \
+      $desired $removals
+  args:
+    executable: /bin/bash
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  register: nvidia_package_transaction
+  changed_when: "'0 newly installed, 0 to remove' not in nvidia_package_transaction.stdout"
+  when: gpustack_node_has_gpu
+
+- name: Refresh the kernel module dependency map
+  ansible.builtin.command:
+    cmd: depmod -a
+  changed_when: false
+  when:
+    - gpustack_node_has_gpu
+    - nvidia_package_transaction.changed | default(false)
+
+- name: Record that this run changed the NVIDIA package state
+  ansible.builtin.set_fact:
+    nvidia_reboot_required_by_role: true
+  when:
+    - gpustack_node_has_gpu
+    - nvidia_package_transaction.changed | default(false)

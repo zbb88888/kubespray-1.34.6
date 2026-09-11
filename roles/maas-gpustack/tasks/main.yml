@@ -1,22 +1,43 @@
 ---
+# 阶段编排见 GPU-Driver.md 第 7 节。pre-k8s 驱动流程：
+#   source        第一台节点安装预编译驱动（不重启）
+#   source_verify 第一台节点重启并验收（可重复执行，幂等）
+#   rollout       其余节点逐台 安装 → 重启 → 验收（playbook 用 serial: 1）
+#   verify        全集群只读终验
+#   reboot        通用重启工具（单节点手动使用）
+- name: Fail fast on an unknown phase
+  ansible.builtin.fail:
+    msg: >-
+      maas_gpustack_phase 取值非法：{{ maas_gpustack_phase | default('未设置') }}。
+      可选值：source、source_verify、rollout、reboot、verify、toolkit、
+      gpustack、reset、check、access。
+  when: >-
+    maas_gpustack_phase | default('') not in
+    ['source', 'source_verify', 'rollout', 'reboot', 'verify',
+     'toolkit', 'gpustack', 'reset', 'check', 'access']
+
 - name: Select the first Kubernetes node as the driver source
   ansible.builtin.set_fact:
     nvidia_driver_source: "{{ nvidia_driver_source | default(groups['kube_node'][0]) }}"
 
-- name: Install and identify the source-node driver
-  ansible.builtin.include_tasks: nvidia-source.yml
+- name: Install the precompiled driver on the source node
+  ansible.builtin.include_tasks: nvidia-preinstall-source.yml
   when: maas_gpustack_phase == 'source'
 
-- name: Compare and synchronize NVIDIA packages
-  ansible.builtin.include_tasks: nvidia-sync.yml
-  when: maas_gpustack_phase == 'sync'
+- name: Reboot the source node and verify it
+  ansible.builtin.include_tasks: nvidia-preinstall-reboot-verify.yml
+  when: maas_gpustack_phase == 'source_verify'
 
-- name: Reboot nodes when required
+- name: Roll out to the remaining nodes one at a time
+  ansible.builtin.include_tasks: nvidia-preinstall-rollout.yml
+  when: maas_gpustack_phase == 'rollout'
+
+- name: Reboot a node that still requires it
   ansible.builtin.include_tasks: nvidia-driver-update-reboot.yml
   when: maas_gpustack_phase == 'reboot'
 
-- name: Verify the post-reboot pure-DKMS state
-  ansible.builtin.include_tasks: nvidia-verify-dkms.yml
+- name: Verify the precompiled driver state
+  ansible.builtin.include_tasks: nvidia-preinstall-verify.yml
   when: maas_gpustack_phase == 'verify'
 
 - name: Install NVIDIA Container Toolkit

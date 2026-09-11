@@ -1,0 +1,81 @@
+---
+# 预编译路线的只读验收（GPU-Driver.md 第 5 节）。
+# 调用方需先 include nvidia-detect-gpu.yml 以得到 gpustack_node_has_gpu。
+
+- name: Collect the kernel module and driver state
+  ansible.builtin.shell: |
+    set -o pipefail
+    module_path="$(modinfo -F filename nvidia 2>/dev/null || true)"
+    module_version="$(modinfo -F version nvidia 2>/dev/null || true)"
+    loaded_version="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n 1 | tr -d ' ' || true)"
+    dkms_packages="$(dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 2>/dev/null |
+      awk '$1 == "ii" {print $2}' | grep -E '^nvidia-dkms-' | paste -sd, - || true)"
+    if dpkg-query -W -f='${db:Status-Abbrev}\n' {{ nvidia_driver_module_payload }} 2>/dev/null | grep -q '^ii'; then
+      payload_installed=true
+    else
+      payload_installed=false
+    fi
+    printf '{"module_path":"%s","module_version":"%s","loaded_version":"%s","dkms_packages":"%s","payload_installed":%s}\n' \
+      "$module_path" "$module_version" "$loaded_version" "$dkms_packages" "$payload_installed"
+  args:
+    executable: /bin/bash
+  register: nvidia_precompiled_probe
+  changed_when: false
+  when: gpustack_node_has_gpu
+
+- name: Parse the collected state
+  ansible.builtin.set_fact:
+    nvidia_precompiled_state: "{{ nvidia_precompiled_probe.stdout | from_json }}"
+  when: gpustack_node_has_gpu
+
+- name: Verify the kernel module comes from the precompiled path
+  ansible.builtin.assert:
+    that:
+      - nvidia_precompiled_state.module_path is search('/kernel/nvidia-')
+      - nvidia_precompiled_state.module_path is not search('/updates/dkms/')
+    fail_msg: >-
+      {{ inventory_hostname }} 的 nvidia 模块来自
+      "{{ nvidia_precompiled_state.module_path | default('missing') }}"，
+      不是预编译路径 /lib/modules/<abi>/kernel/nvidia-<series>-<variant>/。
+      若仍是 updates/dkms，说明 DKMS 模块在 depmod 解析顺序上仍然优先
+      （/etc/depmod.d/ubuntu.conf 的 "search updates ubuntu built-in"）。
+  when: gpustack_node_has_gpu
+
+- name: Verify no DKMS build package is installed
+  ansible.builtin.assert:
+    that:
+      - nvidia_precompiled_state.dkms_packages | length == 0
+    fail_msg: >-
+      {{ inventory_hostname }} 仍装有 DKMS 构建包
+      [{{ nvidia_precompiled_state.dkms_packages }}]；预编译路线要求其不存在。
+  when: gpustack_node_has_gpu
+
+- name: Verify the running kernel ABI has its precompiled payload
+  ansible.builtin.assert:
+    that:
+      - nvidia_precompiled_state.payload_installed | bool
+    fail_msg: >-
+      {{ inventory_hostname }} 的运行内核 {{ ansible_kernel }} 缺少载荷包
+      {{ nvidia_driver_module_payload }}。
+  when: gpustack_node_has_gpu
+
+- name: Verify the loaded driver matches the precompiled module
+  ansible.builtin.assert:
+    that:
+      - nvidia_precompiled_state.loaded_version | length > 0
+      - nvidia_precompiled_state.module_version == nvidia_precompiled_state.loaded_version
+      - nvidia_precompiled_state.module_version.split('.')[0] == nvidia_driver_series
+    fail_msg: >-
+      {{ inventory_hostname }} 的模块版本为
+      {{ nvidia_precompiled_state.module_version | default('missing') }}，
+      已加载驱动为 {{ nvidia_precompiled_state.loaded_version | default('none') }}；
+      两者必须一致，且属于 {{ nvidia_driver_series }} 系列。
+  when: gpustack_node_has_gpu
+
+- name: Publish this node's driver report
+  ansible.builtin.set_fact:
+    nvidia_driver_report:
+      module_path: "{{ nvidia_precompiled_state.module_path }}"
+      module_version: "{{ nvidia_precompiled_state.module_version }}"
+      tracker: "{{ nvidia_driver_module_tracker }}"
+  when: gpustack_node_has_gpu

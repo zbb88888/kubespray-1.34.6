@@ -82,3 +82,31 @@ nvidia_node_ready_timeout: 300s
 # Demo intentionally follows the repository's current package. Pin this to an
 # exact APT version when reproducible Toolkit upgrades are required.
 # nvidia_container_toolkit_version: "1.17.8-1"
+
+# --- NVIDIA 驱动安装方式（预编译路线）---
+# 唯一权威说明见 GPU-Driver.md。本 role 固定使用 Ubuntu archive 的
+# restricted 预编译内核模块：不安装 nvidia-dkms-*，不引入 NVIDIA 驱动源。
+nvidia_driver_series: "595"
+nvidia_driver_variant: "open"
+# 内核 flavor 由运行内核推导：6.8.0-138-generic -> generic
+nvidia_driver_flavor: "{{ ansible_kernel | regex_replace('^[^-]+-[^-]+-', '') }}"
+# 用户态元包：nvidia-smi（nvidia-utils）、libcuda、persistenced 等
+nvidia_driver_userspace_metapackage: >-
+  nvidia-driver-{{ nvidia_driver_series }}-{{ nvidia_driver_variant }}
+# 内核模块追踪包：跟随内核 ABI 升级，内核升级后自动指向新 ABI 的载荷包
+nvidia_driver_module_tracker: >-
+  linux-modules-nvidia-{{ nvidia_driver_series }}-{{ nvidia_driver_variant }}-{{ nvidia_driver_flavor }}
+# 运行内核 ABI 的载荷包：切换期间保证当前运行内核仍有模块可用
+nvidia_driver_module_payload: >-
+  linux-modules-nvidia-{{ nvidia_driver_series }}-{{ nvidia_driver_variant }}-{{ ansible_kernel }}
+# 必须不存在的 DKMS 构建包（nvidia-kernel-source-* 由用户态元包依赖，保留且不注册 DKMS）
+nvidia_driver_dkms_packages:
+  - "nvidia-dkms-{{ nvidia_driver_series }}-{{ nvidia_driver_variant }}"
+# 用 apt 负向 pin 阻止依赖解析把 DKMS 构建包装回来
+nvidia_driver_block_dkms: true
+# 注意：apt 只读取 preferences.d 下 .pref 或无扩展名的文件，其它扩展名
+# （如 .prefs）会被静默忽略。实测：.prefs 不生效，.pref 生效。
+nvidia_driver_apt_pin_file: /etc/apt/preferences.d/nvidia-precompiled-only.pref
+# 重启：默认逐台人工确认；无人值守场景设为 false
+nvidia_reboot_confirm: true
+nvidia_reboot_timeout: 900

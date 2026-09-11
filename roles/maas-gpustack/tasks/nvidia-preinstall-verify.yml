@@ -1,0 +1,42 @@
+---
+# 第四阶段：全集群只读终验，并断言所有 GPU 节点落在同一个驱动版本上。
+
+- name: Detect whether this node has an NVIDIA GPU
+  ansible.builtin.include_tasks: nvidia-detect-gpu.yml
+
+- name: Verify the precompiled driver state on this node
+  ansible.builtin.include_tasks: nvidia-preinstall-check.yml
+
+- name: Collect the cluster-wide driver versions
+  ansible.builtin.set_fact:
+    nvidia_cluster_driver_versions: >-
+      {%- set versions = [] -%}
+      {%- for node in groups['kube_node'] -%}
+      {%-   set report = hostvars[node].nvidia_driver_report | default({}) -%}
+      {%-   if report | length > 0 -%}
+      {%-     set _ = versions.append(report.module_version) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ versions | unique | list }}
+  delegate_to: localhost
+  delegate_facts: true
+  run_once: true
+
+- name: Require one driver version across all GPU nodes
+  ansible.builtin.assert:
+    that:
+      - hostvars['localhost'].nvidia_cluster_driver_versions | length == 1
+    fail_msg: >-
+      集群 GPU 节点的驱动版本不一致：
+      {{ hostvars['localhost'].nvidia_cluster_driver_versions }}。
+      若列表为空，说明没有任何节点报告 GPU 驱动状态（检查 lspci 与
+      gpustack_gpu_pci_vendor_id）；否则同一 archive 快照下各节点应解析到相同
+      版本，请对落后节点重跑 rollout 阶段。
+  run_once: true
+
+- name: Report this node's driver state
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}：{{ nvidia_driver_report.module_path | default('无 GPU，跳过') }}
+      （版本 {{ nvidia_driver_report.module_version | default('-') }}）
+  when: gpustack_node_has_gpu

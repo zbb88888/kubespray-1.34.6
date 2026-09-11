@@ -1,0 +1,55 @@
+---
+# 第三阶段：其余节点逐台 安装 → 重启 → 验收。
+# 逐台顺序由 playbook 的 serial: 1 保证；any_errors_fatal 保证失败即停。
+
+# 每次准备给下一台节点动手之前，先用金丝雀（第一台）节点复核当前状态。
+# run_once + delegate_to 让这段检查每批只跑一次，且跑在第一台节点上。
+- name: Re-check the source node before touching another node
+  ansible.builtin.shell: |
+    set -o pipefail
+    path="$(modinfo -F filename nvidia 2>/dev/null || true)"
+    [ -n "$path" ] || { echo "no nvidia module is installed"; exit 1; }
+    case "$path" in
+      */kernel/nvidia-*) ;;
+      *) echo "not a precompiled module path: $path"; exit 1 ;;
+    esac
+    dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 2>/dev/null |
+      awk '$1 == "ii" {print $2}' | grep -q '^nvidia-dkms-' &&
+      { echo "a DKMS build package is still installed"; exit 1; }
+    echo "$path"
+  args:
+    executable: /bin/bash
+  register: nvidia_canary_state
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ nvidia_driver_source }}"
+  when: inventory_hostname != nvidia_driver_source
+
+- name: Require a complete source node before rolling out
+  ansible.builtin.assert:
+    that:
+      - nvidia_canary_state.rc | default(1) == 0
+    fail_msg: >-
+      第一台节点 {{ nvidia_driver_source }} 尚未处于预编译完备状态：
+      {{ nvidia_canary_state.stdout | default('') }}
+      {{ nvidia_canary_state.stderr | default('') }}
+      请先完成 source 与 source_verify 阶段，再滚动其余节点。
+  run_once: true
+  when:
+    - nvidia_canary_state is defined
+    - nvidia_canary_state is not skipped
+
+- name: Install the precompiled driver on the remaining nodes
+  ansible.builtin.include_tasks: nvidia-preinstall-install.yml
+  when: inventory_hostname != nvidia_driver_source
+
+- name: Reboot and verify each node before moving on
+  ansible.builtin.include_tasks: nvidia-preinstall-reboot-verify.yml
+  when: inventory_hostname != nvidia_driver_source
+
+- name: Report the node result
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}：{{ nvidia_driver_report.module_path | default('无 GPU，跳过') }}
+      （版本 {{ nvidia_driver_report.module_version | default('-') }}）
+  when: inventory_hostname != nvidia_driver_source
